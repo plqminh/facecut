@@ -1,0 +1,13 @@
+
+ultralytics
+customtkinter
+moviepy
+opencv-python-headless
+numpy
+packaging
+torch
+torchvision
+torchaudio
+pillow
+face-alignment
+mediapipe
