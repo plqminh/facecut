@@ -6,6 +6,9 @@ import mediapipe as mp
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 import torch
 import os
+import urllib.request
+import zipfile
+import shutil
 
 class VideoProcessor:
     def __init__(self, model_type='yolo'):
@@ -14,6 +17,18 @@ class VideoProcessor:
         self.model = None
         self.detector = None
         self.mp_face_detection = None
+        self.gender_net = None
+        # InsightFace GenderAge Model: 0=Female, 1=Male
+        self.gender_list = ['Female', 'Male'] 
+        self.gender_model = "genderage.onnx"
+        
+        # Face Recognition
+        self.rec_net = None
+        self.rec_model = "w600k_mbf.onnx"
+        self.reference_embedding = None
+        
+        self.ensure_models()
+        self.load_models()
         
         print(f"Loading {self.model_type.upper()} model on {self.device}...")
         
@@ -32,12 +47,147 @@ class VideoProcessor:
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
-    def check_obstruction(self, box, img_w, img_h, margin_ratio=0.0):
+    def ensure_models(self):
+        # Gender
+        if not os.path.exists(self.gender_model):
+            print("Downloading gender model (ONNX)...")
+            url = "https://huggingface.co/lithiumice/insightface/resolve/main/models/buffalo_l/genderage.onnx"
+            try:
+                urllib.request.urlretrieve(url, self.gender_model)
+            except Exception as e:
+                print(f"Failed to download gender model: {e}")
+
+        # Rec
+        if not os.path.exists(self.rec_model):
+            print("Downloading face recognition model (ONNX)...")
+            zip_name = "buffalo_s.zip"
+            url = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip"
+            try:
+                # Download Zip
+                urllib.request.urlretrieve(url, zip_name)
+                # Extract
+                with zipfile.ZipFile(zip_name, 'r') as zip_ref:
+                    # Look for w600k_mbf.onnx inside
+                    found = False
+                    for file in zip_ref.namelist():
+                        if file.endswith("w600k_mbf.onnx"):
+                            source = zip_ref.open(file)
+                            target = open(self.rec_model, "wb")
+                            with source, target:
+                                shutil.copyfileobj(source, target)
+                            found = True
+                            print(f"Extracted {self.rec_model}")
+                            break
+                    if not found:
+                        print("w600k_mbf.onnx not found in zip!")
+                
+                # Cleanup
+                os.remove(zip_name)
+            except Exception as e:
+                print(f"Failed to download/extract rec model: {e}")
+
+    def load_models(self):
+        # Gender
+        try:
+            self.gender_net = cv2.dnn.readNetFromONNX(self.gender_model)
+            self.gender_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.gender_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        except Exception as e:
+            print(f"Failed to load gender model: {e}")
+            self.gender_net = None
+
+        # Rec
+        try:
+            self.rec_net = cv2.dnn.readNetFromONNX(self.rec_model)
+            self.rec_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.rec_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        except Exception as e:
+            print(f"Failed to load rec model: {e}")
+            self.rec_net = None
+
+    def get_embedding(self, face_img):
+        if self.rec_net is None:
+            return None
+            
+        # Preprocessing for InsightFace Rec (MobileFaceNet/ArcFace)
+        # 112x112, RGB
+        # Normalization: (x - 127.5) / 128.0
+        blob = cv2.dnn.blobFromImage(face_img, 1.0/127.5, (112, 112), 
+                                   (127.5, 127.5, 127.5), 
+                                   swapRB=True, crop=False)
+        self.rec_net.setInput(blob)
+        embedding = self.rec_net.forward()
+        # Normalize the embedding vector
+        norm_embedding = embedding / np.linalg.norm(embedding)
+        return norm_embedding
+
+    def compute_sim(self, feat1, feat2):
+        if feat1 is None or feat2 is None:
+            return 0.0
+        return np.dot(feat1, feat2.T)[0][0]
+
+    def set_reference_face(self, image_path):
+        if not os.path.exists(image_path):
+            return False, "File not found"
+            
+        img = cv2.imread(image_path)
+        if img is None:
+            return False, "Could not read image"
+            
+        # Detect face in reference image - use our own scan logic but simplified
+        # For simplicity, use the configured detector.
+        # But we need to define 'detect_faces' expects a detector...
+        # We can just use the current initialized detector logic
+        detections = self.detect_faces(img, min_conf=0.5)
+        
+        if not detections:
+             return False, "No face found in reference image"
+        
+        # Pick largest face
+        best_face = None
+        max_area = 0
+        img_h, img_w, _ = img.shape
+        
+        for x1, y1, x2, y2, conf in detections:
+            area = (x2-x1) * (y2-y1)
+            if area > max_area:
+                max_area = area
+                best_face = (x1, y1, x2, y2)
+        
+        if best_face:
+            x1, y1, x2, y2 = best_face
+            face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+            if face_img.size > 0:
+                self.reference_embedding = self.get_embedding(face_img)
+                return True, "Reference face set"
+                
+        return False, "Could not process reference face"
+
+    def predict_gender(self, face_img):
+        if self.gender_net is None:
+            return "Unknown"
+        
+        # InsightFace GenderAge Preprocessing
+        # Resize to 96x96
+        # Mean 127.5, Scale 1/128.0 (approx 0.0078125)
+        # RGB (swapRB=True because OpenCV is BGR)
+        blob = cv2.dnn.blobFromImage(face_img, 1.0/128.0, (96, 96), 
+                                   (127.5, 127.5, 127.5), 
+                                   swapRB=True, crop=False)
+        self.gender_net.setInput(blob)
+        preds = self.gender_net.forward()
+        # Output shape is (1, 3). [0, 1] are gender logits.
+        # 0 -> Female, 1 -> Male
+        gender_idx = np.argmax(preds[0][:2])
+        return self.gender_list[gender_idx]
+
+    def check_obstruction(self, box, img_w, img_h, margin_ratio=0.0, max_obstruction=0.0):
         """
         Check if the bounding box is significantly obstructed by the frame edge.
         Box format: x1, y1, x2, y2
         margin_ratio: float 0.0-1.0, fraction of dimension to use as margin.
-        Returns True if obstructed (>50% area in margin/out of bounds), False otherwise.
+        max_obstruction: float 0.0-1.0, max allowed obstructed ratio.
+        Returns True if obstructed (>max_obstruction), False otherwise.
         """
         x1, y1, x2, y2 = box
         box_w = x2 - x1
@@ -71,8 +221,8 @@ class VideoProcessor:
         obstructed_area = box_area - inter_area
         obstruction_ratio = obstructed_area / box_area
         
-        # Strict: any obstruction is too much
-        if obstruction_ratio > 0.0:
+        # Strictness check
+        if obstruction_ratio > max_obstruction:
             return True
             
         return False
@@ -193,7 +343,7 @@ class VideoProcessor:
                         
         return detections
 
-    def scan_video(self, video_path, min_conf, require_unobstructed=False, obstruction_margin=0.0, min_duration=0.0, max_angle=90, progress_callback=None, preview_callback=None, stop_event=None):
+    def scan_video(self, video_path, min_conf, obstruction_threshold=0.0, obstruction_margin=0.0, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, progress_callback=None, preview_callback=None, stop_event=None):
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -220,11 +370,34 @@ class VideoProcessor:
             img_h, img_w, _ = frame.shape
             
             for x1, y1, x2, y2, conf in detections:
-                if require_unobstructed:
-                    if not self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin):
-                        is_valid = True
-                        break
-                else:
+                face_passed = False
+                # Obstruction Check
+                if not self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin, obstruction_threshold):
+                    face_passed = True
+                    
+                # Check Gender if needed (and if face passed obstruction check)
+                if face_passed and target_gender != "All":
+                    # Crop face
+                    face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                    if face_img.size > 0:
+                        gender = self.predict_gender(face_img)
+                        if gender != target_gender:
+                            face_passed = False
+                    else:
+                        face_passed = False
+
+                # Check Recognition if active
+                if face_passed and self.reference_embedding is not None:
+                    face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                    if face_img.size > 0:
+                        emb = self.get_embedding(face_img)
+                        sim = self.compute_sim(emb, self.reference_embedding)
+                        if sim < rec_threshold:
+                            face_passed = False
+                    else:
+                        face_passed = False
+
+                if face_passed:
                     is_valid = True
                     break
             
@@ -236,12 +409,22 @@ class VideoProcessor:
                 annotated_frame = frame.copy()
                 for x1, y1, x2, y2, conf in detections:
                     face_valid = True
-                    if require_unobstructed and self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin):
+                    if self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin, obstruction_threshold):
                         face_valid = False
                     
+                    gender_label = ""
+                    if face_valid and self.reference_embedding is not None:
+                         face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                         if face_img.size > 0:
+                            emb = self.get_embedding(face_img)
+                            sim = self.compute_sim(emb, self.reference_embedding)
+                            gender_label += f" Sim:{sim:.2f}"
+                            if sim < rec_threshold:
+                                face_valid = False
+
                     color = (0, 255, 0) if face_valid else (0, 0, 255)
                     cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                    label = f"Conf: {conf:.2f}"
+                    label = f"Conf: {conf:.2f}{gender_label}"
                     cv2.putText(annotated_frame, label, (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
@@ -320,7 +503,7 @@ class VideoProcessor:
         except Exception as e:
             return False, f"Video editing error: {str(e)}"
 
-    def process_frame(self, frame, min_conf, require_unobstructed=False, obstruction_margin=0.0, max_angle=90):
+    def process_frame(self, frame, min_conf, obstruction_threshold=0.0, obstruction_margin=0.0, max_angle=90, target_gender="All", rec_threshold=0.5):
         """
         Process a single frame for preview.
         Returns: annotated_frame, is_valid_frame
@@ -333,15 +516,25 @@ class VideoProcessor:
         
         for x1, y1, x2, y2, conf in detections:
             face_valid = True
-            if require_unobstructed and self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin):
+            if self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin, obstruction_threshold):
                 face_valid = False
             
+            gender_label = ""
+            if face_valid and self.reference_embedding is not None:
+                    face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                    if face_img.size > 0:
+                        emb = self.get_embedding(face_img)
+                        sim = self.compute_sim(emb, self.reference_embedding)
+                        gender_label += f" Sim:{sim:.2f}"
+                        if sim < rec_threshold:
+                            face_valid = False
+
             if face_valid:
                 frame_valid = True
 
             color = (0, 255, 0) if face_valid else (0, 0, 255)
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            label = f"Conf: {conf:.2f}"
+            label = f"Conf: {conf:.2f}{gender_label}"
             cv2.putText(annotated_frame, label, (x1, y1 - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 

@@ -58,43 +58,72 @@ class FaceCutApp(ctk.CTk):
         self.slider_conf.set(0.6)
         self.slider_conf.grid(row=8, column=0, padx=20, pady=(0, 10), sticky="ew")
         
-        # Obstruction Check
-        self.check_obstruction = ctk.CTkCheckBox(self.sidebar, text="Strict: No Obstruction")
-        self.check_obstruction.grid(row=9, column=0, padx=20, pady=(10, 0), sticky="w")
-        
         # Margin Slider
-        self.lbl_margin = ctk.CTkLabel(self.sidebar, text="Edge Margin: 0.0%")
-        self.lbl_margin.grid(row=10, column=0, padx=20, pady=(10, 0), sticky="w")
-        self.slider_margin = ctk.CTkSlider(self.sidebar, from_=-10, to=25, number_of_steps=70, command=self.update_margin_label)
+        self.lbl_margin = ctk.CTkLabel(self.sidebar, text="Edge Margin: 0%")
+        self.lbl_margin.grid(row=9, column=0, padx=20, pady=(10, 0), sticky="w")
+        
+        self.slider_margin = ctk.CTkSlider(self.sidebar, from_=0, to=40, number_of_steps=40, command=self.update_margin_label)
         self.slider_margin.set(0)
-        self.slider_margin.grid(row=11, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_margin.grid(row=10, column=0, padx=20, pady=(0, 10), sticky="ew")
+
+        # Obstruction Threshold
+        self.lbl_obstruction = ctk.CTkLabel(self.sidebar, text="Max Obstruction: 0% (Strict)")
+        self.lbl_obstruction.grid(row=11, column=0, padx=20, pady=(5, 0), sticky="w")
+        
+        self.slider_obstruction = ctk.CTkSlider(self.sidebar, from_=0.0, to=0.5, number_of_steps=50, command=self.update_obstruction_label)
+        self.slider_obstruction.set(0.0)
+        self.slider_obstruction.grid(row=12, column=0, padx=20, pady=(0, 10), sticky="ew")
         
         # Min Duration Slider
         self.lbl_duration = ctk.CTkLabel(self.sidebar, text="Min Duration: 0.5s")
-        self.lbl_duration.grid(row=12, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_duration.grid(row=13, column=0, padx=20, pady=(10, 0), sticky="w")
         self.slider_duration = ctk.CTkSlider(self.sidebar, from_=0.0, to=2.0, number_of_steps=20, command=self.update_duration_label)
         self.slider_duration.set(0.5)
-        self.slider_duration.grid(row=13, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_duration.grid(row=14, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Max Angle Slider (MediaPipe only)
         self.lbl_angle = ctk.CTkLabel(self.sidebar, text="Max Angle: 45°")
-        self.lbl_angle.grid(row=14, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_angle.grid(row=15, column=0, padx=20, pady=(10, 0), sticky="w")
         self.slider_angle = ctk.CTkSlider(self.sidebar, from_=10, to=90, number_of_steps=80, command=self.update_angle_label)
         self.slider_angle.set(45)
-        self.slider_angle.grid(row=15, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_angle.grid(row=16, column=0, padx=20, pady=(0, 10), sticky="ew")
+
+        # Gender Selection
+        self.lbl_gender = ctk.CTkLabel(self.sidebar, text="Keep Gender")
+        self.lbl_gender.grid(row=17, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.combo_gender = ctk.CTkComboBox(self.sidebar, values=["All", "Male", "Female"])
+        self.combo_gender.set("All")
+        self.combo_gender.grid(row=18, column=0, padx=20, pady=(0, 10), sticky="ew")
+
+        # Face Recognition
+        self.lbl_rec = ctk.CTkLabel(self.sidebar, text="Face Recognition")
+        self.lbl_rec.grid(row=19, column=0, padx=20, pady=(10, 0), sticky="w")
+        
+        self.btn_ref_face = ctk.CTkButton(self.sidebar, text="Set Ref Face", command=self.set_reference_face)
+        self.btn_ref_face.grid(row=20, column=0, padx=20, pady=(5, 5), sticky="ew")
+        
+        self.lbl_ref_status = ctk.CTkLabel(self.sidebar, text="No Ref Face", font=ctk.CTkFont(size=10))
+        self.lbl_ref_status.grid(row=21, column=0, padx=20, pady=(0, 5))
+        
+        self.lbl_sim = ctk.CTkLabel(self.sidebar, text="Sim Threshold: 0.50")
+        self.lbl_sim.grid(row=22, column=0, padx=20, pady=(5, 0), sticky="w")
+        
+        self.slider_sim = ctk.CTkSlider(self.sidebar, from_=0.1, to=1.0, number_of_steps=90, command=self.update_sim_label)
+        self.slider_sim.set(0.5)
+        self.slider_sim.grid(row=23, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         self.btn_process = ctk.CTkButton(self.sidebar, text="Start Processing", command=self.start_processing, state="disabled", fg_color="green")
-        self.btn_process.grid(row=16, column=0, padx=20, pady=(20, 10))
+        self.btn_process.grid(row=24, column=0, padx=20, pady=(20, 10))
 
         self.btn_stop = ctk.CTkButton(self.sidebar, text="Stop", command=self.stop_processing, state="disabled", fg_color="red")
-        self.btn_stop.grid(row=17, column=0, padx=20, pady=(0, 10))
+        self.btn_stop.grid(row=25, column=0, padx=20, pady=(0, 10))
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar)
-        self.progress_bar.grid(row=18, column=0, padx=20, pady=10, sticky="ew")
+        self.progress_bar.grid(row=26, column=0, padx=20, pady=10, sticky="ew")
         self.progress_bar.set(0)
 
         self.lbl_status = ctk.CTkLabel(self.sidebar, text="Ready")
-        self.lbl_status.grid(row=19, column=0, padx=20, pady=10)
+        self.lbl_status.grid(row=27, column=0, padx=20, pady=10)
 
 
         # --- Middle Column (Clip List) ---
@@ -181,13 +210,34 @@ class FaceCutApp(ctk.CTk):
         self.lbl_conf.configure(text=f"Confidence: {value:.2f}")
 
     def update_margin_label(self, value):
-        self.lbl_margin.configure(text=f"Edge Margin: {value:.1f}%")
+        self.lbl_margin.configure(text=f"Edge Margin: {int(value)}%")
+
+    def update_obstruction_label(self, value):
+        percent = int(value * 100)
+        text = f"Max Obstruction: {percent}%"
+        if percent == 0:
+            text += " (Strict)"
+        self.lbl_obstruction.configure(text=text)
 
     def update_duration_label(self, value):
         self.lbl_duration.configure(text=f"Min Duration: {value:.1f}s")
 
     def update_angle_label(self, value):
         self.lbl_angle.configure(text=f"Max Angle: {int(value)}°")
+
+    def update_sim_label(self, value):
+        self.lbl_sim.configure(text=f"Sim Threshold: {value:.2f}")
+
+    def set_reference_face(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png *.jpeg")])
+        if file_path:
+            success, msg = self.processor.set_reference_face(file_path)
+            if success:
+                self.lbl_ref_status.configure(text=os.path.basename(file_path), text_color="green")
+                messagebox.showinfo("Success", "Reference face set successfully.")
+            else:
+                self.lbl_ref_status.configure(text="Error", text_color="red")
+                messagebox.showerror("Error", msg)
 
     def select_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4 *.mov *.avi")])
@@ -276,12 +326,15 @@ class FaceCutApp(ctk.CTk):
             scale = display_h / h
             display_w = int(w * scale)
             
-            if self.processor:
+            if frame is not None:
                 min_conf = self.slider_conf.get()
-                require_unobstructed = bool(self.check_obstruction.get())
+                # Use obstruction slider
+                obstruction_thresh = self.slider_obstruction.get()
                 margin = self.slider_margin.get() / 100.0
                 max_angle = self.slider_angle.get()
-                frame, is_valid = self.processor.process_frame(frame, min_conf, require_unobstructed, margin, max_angle)
+                target_gender = self.combo_gender.get()
+                rec_thresh = self.slider_sim.get()
+                frame, is_valid = self.processor.process_frame(frame, min_conf, obstruction_thresh, margin, max_angle, target_gender, rec_thresh)
             
             frame = cv2.resize(frame, (display_w, display_h))
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -305,16 +358,18 @@ class FaceCutApp(ctk.CTk):
             self.toggle_play()
 
         min_conf = self.slider_conf.get()
-        require_unobstructed = bool(self.check_obstruction.get())
+        obstruction_thresh = self.slider_obstruction.get()
         margin = self.slider_margin.get() / 100.0
         min_dur = self.slider_duration.get()
         max_angle = self.slider_angle.get()
+        target_gender = self.combo_gender.get()
+        rec_thresh = self.slider_sim.get()
         self.stop_event.clear()
 
         # Clear existing clips
         self.clear_clip_list()
 
-        threading.Thread(target=self.run_processing, args=(min_conf, require_unobstructed, margin, min_dur, max_angle)).start()
+        threading.Thread(target=self.run_processing, args=(min_conf, obstruction_thresh, margin, min_dur, max_angle, target_gender, rec_thresh)).start()
 
     def stop_processing(self):
         self.stop_event.set()
@@ -374,7 +429,7 @@ class FaceCutApp(ctk.CTk):
         self.start_rendering(selected_segments)
 
 
-    def run_processing(self, min_conf, require_unobstructed, margin, min_dur, max_angle):
+    def run_processing(self, min_conf, obstruction_thresh, margin, min_dur, max_angle, target_gender, rec_thresh):
         try:
             # Phase 1: Scan
             def update_prog(p):
@@ -403,10 +458,12 @@ class FaceCutApp(ctk.CTk):
             segments, msg = self.processor.scan_video(
                 self.video_path,
                 min_conf,
-                require_unobstructed,
+                obstruction_threshold=obstruction_thresh,
                 obstruction_margin=margin,
                 min_duration=min_dur,
                 max_angle=max_angle,
+                target_gender=target_gender,
+                rec_threshold=rec_thresh,
                 progress_callback=update_prog,
                 preview_callback=update_preview,
                 stop_event=self.stop_event
@@ -498,7 +555,9 @@ class FaceCutApp(ctk.CTk):
                     "margin": self.slider_margin.get(),
                     "min_duration": self.slider_duration.get(),
                     "max_angle": self.slider_angle.get(),
-                    "obstruction_check": bool(self.check_obstruction.get())
+                    "obstruction_threshold": self.slider_obstruction.get(),
+                    "target_gender": self.combo_gender.get(),
+                    "rec_threshold": self.slider_sim.get() 
                 }
             }
             with open(json_path, 'w') as f:
@@ -523,6 +582,45 @@ class FaceCutApp(ctk.CTk):
             if "segments" in data:
                 print(f"Loaded {len(data['segments'])} segments from {json_path}")
                 self.populate_clip_list(data['segments'])
+                
+                # Load parameters
+                if "parameters" in data:
+                    params = data["parameters"]
+                    if "min_conf" in params:
+                        self.slider_conf.set(params["min_conf"])
+                        self.update_conf_label(params["min_conf"])
+                    if "margin" in params:
+                        self.slider_margin.set(params["margin"])
+                        self.update_margin_label(params["margin"])
+                    if "min_duration" in params:
+                        self.slider_duration.set(params["min_duration"])
+                        self.update_duration_label(params["min_duration"])
+                    if "max_angle" in params:
+                        self.slider_angle.set(params["max_angle"])
+                        self.update_angle_label(params["max_angle"])
+                    
+                    # Handle old obstruction_check
+                    if "obstruction_check" in params:
+                        # If old bool was True (strict), set thresh to 0.0. If False, maybe 0.5?
+                        if params["obstruction_check"]:
+                            self.slider_obstruction.set(0.0)
+                            self.update_obstruction_label(0.0)
+                        else:
+                            # Lax
+                            self.slider_obstruction.set(0.5)
+                            self.update_obstruction_label(0.5)
+
+                    if "obstruction_threshold" in params:
+                        val = params["obstruction_threshold"]
+                        self.slider_obstruction.set(val)
+                        self.update_obstruction_label(val)
+
+                    if "target_gender" in params:
+                        self.combo_gender.set(params["target_gender"])
+                    if "rec_threshold" in params:
+                        self.slider_sim.set(params["rec_threshold"])
+                        self.update_sim_label(params["rec_threshold"])
+
                 self.lbl_status.configure(text=f"Loaded {len(data['segments'])} saved clips")
         except Exception as e:
             print(f"Failed to load segments: {e}")
