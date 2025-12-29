@@ -105,21 +105,136 @@ class VideoProcessor:
             print(f"Failed to load rec model: {e}")
             self.rec_net = None
 
-    def get_embedding(self, face_img):
-        if self.rec_net is None:
-            return None
+
+
+    def calculate_quality_metrics(self, face_img):
+        """
+        Calculate Sharpness (Laplacian Var) and Brightness with masking.
+        - Brightness: Ignored black padding (0 pixels).
+        - Sharpness: Calculated on Central ROI to avoid border artifacts.
+        Returns: sharpness, brightness
+        """
+        if face_img.size == 0:
+            return 0, 0
             
+        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        
+        # Mask: Ignore purely black pixels (padding from alignment)
+        mask = gray > 1
+        if np.count_nonzero(mask) == 0:
+            return 0, 0
+            
+        # Brightness: Mean of Valid Pixels only
+        brightness = np.mean(gray[mask])
+        
+        # Sharpness: Use Center Crop (50%) to avoid border edges
+        h, w = gray.shape
+        cy, cx = h // 2, w // 2
+        # Crop 50% from center
+        h4, w4 = h // 4, w // 4
+        roi = gray[cy - h4 : cy + h4, cx - w4 : cx + w4]
+        
+        if roi.size > 0:
+             sharpness = cv2.Laplacian(roi, cv2.CV_64F).var()
+        else:
+             sharpness = 0
+        
+        return sharpness, brightness
+
+    def get_embedding(self, face_img, landmarks=None, tilt_boost=1.0):
+        if self.rec_net is None:
+            return None, 0.0
+
+        # Quality Metrics Calculation (Pre-normalization)
+        sharpness, brightness = self.calculate_quality_metrics(face_img)
+
+        # Alignment
+        blob_input = face_img
+        
         # Preprocessing for InsightFace Rec (MobileFaceNet/ArcFace)
         # 112x112, RGB
         # Normalization: (x - 127.5) / 128.0
-        blob = cv2.dnn.blobFromImage(face_img, 1.0/127.5, (112, 112), 
+        
+        # If image is big, resize. If 112x112 (aligned), keep.
+        if face_img.shape[0] != 112 or face_img.shape[1] != 112:
+             # Standard Resize if not already aligned
+             blob_input = cv2.resize(face_img, (112, 112))
+        else:
+             blob_input = face_img
+             
+        blob = cv2.dnn.blobFromImage(blob_input, 1.0/127.5, (112, 112), 
                                    (127.5, 127.5, 127.5), 
                                    swapRB=True, crop=False)
         self.rec_net.setInput(blob)
         embedding = self.rec_net.forward()
+        # Quality Score (Feature Norm)
+        feature_norm = np.linalg.norm(embedding)
+        
+        # Composite Quality Score
+        # Start with Feature Norm (proxy for "face-ness" and detail)
+        composite_score = feature_norm
+        
+        # Penalty 1: Sharpness (Blur)
+        # Adaptive thresholds for tilted faces
+        sharp_thresh_low = 30
+        sharp_thresh_high = 60
+        
+        if tilt_boost > 1.0:
+            # Relaxed thresholds for tilted faces (cubic interp softens edges)
+            sharp_thresh_low = 20
+            sharp_thresh_high = 40
+
+        if sharpness < sharp_thresh_low:
+            composite_score *= 0.5
+        elif sharpness < sharp_thresh_high:
+            composite_score *= 0.8
+            
+        # Penalty 2: Brightness (Exposure)
+        # Range 0-255. <30 is dark, >230 is washed out.
+        if brightness < 30 or brightness > 230:
+            composite_score *= 0.6
+            
+        # Tilt Boost
+        if tilt_boost > 1.0:
+            # Stronger boost for tilted faces to ensure robustness
+            composite_score *= 1.3
+            
         # Normalize the embedding vector
-        norm_embedding = embedding / np.linalg.norm(embedding)
-        return norm_embedding
+        norm_embedding = embedding / (feature_norm + 1e-5)
+        
+        return norm_embedding, composite_score
+
+    def align_face(self, img, landmarks):
+        """
+        Align face using 5-point landmarks to standard ArcFace template (112x112).
+        Landmarks: list/array of 5 points [(x,y), ...].
+        Returns: aligned_img (112, 112, 3)
+        """
+        if landmarks is None or len(landmarks) != 5:
+            # Fallback for unexpected landmark count
+            return None
+            
+        # Standard ArcFace 112x112 reference points
+        src = np.array([
+            [38.2946, 51.6963],
+            [73.5318, 51.5014],
+            [56.0252, 71.7366],
+            [41.5493, 92.3655],
+            [70.7299, 92.2041] ], dtype=np.float32)
+            
+        dst = np.array(landmarks, dtype=np.float32)
+        
+        # Estimate affine transform
+        tform = cv2.estimateAffinePartial2D(dst, src, method=cv2.LMEDS)[0]
+        if tform is None:
+             # Fallback to simple affine if LMEDS fails
+             tform = cv2.estimateAffinePartial2D(dst, src)[0]
+             
+        if tform is None:
+            return None
+            
+        aligned_img = cv2.warpAffine(img, tform, (112, 112), flags=cv2.INTER_CUBIC, borderValue=0.0)
+        return aligned_img
 
     def compute_sim(self, feat1, feat2):
         if feat1 is None or feat2 is None:
@@ -148,17 +263,24 @@ class VideoProcessor:
         max_area = 0
         img_h, img_w, _ = img.shape
         
-        for x1, y1, x2, y2, conf in detections:
+        for x1, y1, x2, y2, conf, lm in detections:
             area = (x2-x1) * (y2-y1)
             if area > max_area:
                 max_area = area
-                best_face = (x1, y1, x2, y2)
+                best_face = (x1, y1, x2, y2, conf, lm)
         
         if best_face:
-            x1, y1, x2, y2 = best_face
-            face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+            x1, y1, x2, y2, _, landmarks = best_face
+            # If landmarks exist, align from FULL image
+            if landmarks is not None:
+                 face_img = self.align_face(img, landmarks)
+                 if face_img is None:
+                      face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+            else:
+                 face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+            
             if face_img.size > 0:
-                self.reference_embedding = self.get_embedding(face_img)
+                self.reference_embedding, _ = self.get_embedding(face_img)
                 return True, "Reference face set"
                 
         return False, "Could not process reference face"
@@ -181,51 +303,67 @@ class VideoProcessor:
         gender_idx = np.argmax(preds[0][:2])
         return self.gender_list[gender_idx]
 
-    def check_obstruction(self, box, img_w, img_h, margin_ratio=0.0, max_obstruction=0.0):
-        """
-        Check if the bounding box is significantly obstructed by the frame edge.
-        Box format: x1, y1, x2, y2
-        margin_ratio: float 0.0-1.0, fraction of dimension to use as margin.
-        max_obstruction: float 0.0-1.0, max allowed obstructed ratio.
-        Returns True if obstructed (>max_obstruction), False otherwise.
-        """
-        x1, y1, x2, y2 = box
-        box_w = x2 - x1
-        box_h = y2 - y1
-        box_area = box_w * box_h
-        
-        if box_area <= 0:
-            return True
 
-        # Define Safe Zone
-        margin_w = int(img_w * margin_ratio)
-        margin_h = int(img_h * margin_ratio)
+
+    def estimate_pose_from_landmarks(self, landmarks):
+        """
+        Estimate Yaw, Pitch, Roll from 5 landmarks (Image coords).
+        Landmarks: [RightEye, LeftEye, Nose, RightMouth, LeftMouth] (Image coords)
+        Returns: yaw, pitch, roll (degrees)
+        """
+        if landmarks is None or len(landmarks) != 5:
+            return 0, 0, 0
+
+        re = landmarks[0]
+        le = landmarks[1]
+        nose = landmarks[2]
+        rm = landmarks[3]
+        lm = landmarks[4]
         
-        safe_x1 = margin_w
-        safe_y1 = margin_h
-        safe_x2 = img_w - margin_w
-        safe_y2 = img_h - margin_h
+        # Roll: Angle of eye line
+        dx = le[0] - re[0]
+        dy = le[1] - re[1]
+        roll = np.degrees(np.arctan2(dy, dx))
         
-        # Calculate Intersection with Safe Zone
-        inter_x1 = max(x1, safe_x1)
-        inter_y1 = max(y1, safe_y1)
-        inter_x2 = min(x2, safe_x2)
-        inter_y2 = min(y2, safe_y2)
+        # Normalize points by rotating -roll (make eyes horizontal)
+        center = nose
+        M = cv2.getRotationMatrix2D((center[0], center[1]), roll, 1.0)
+        pts = np.array([re, le, nose, rm, lm]).reshape(-1, 1, 2)
+        pts_rot = cv2.transform(pts, M).squeeze()
         
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
+        tre = pts_rot[0]
+        tle = pts_rot[1]
+        tn = pts_rot[2]
+        trm = pts_rot[3]
+        tlm = pts_rot[4]
         
-        # Calculate Obstruction Ratio
-        # Obstruction is the part of the box NOT in the intersection
-        obstructed_area = box_area - inter_area
-        obstruction_ratio = obstructed_area / box_area
-        
-        # Strictness check
-        if obstruction_ratio > max_obstruction:
-            return True
+        # Yaw: Nose deviation from eye midpoint (Horizontal)
+        eye_mid_x = (tre[0] + tle[0]) / 2
+        eye_width = tle[0] - tre[0]
+        # Nose off-center ratio. 
+        # Factor ~300 found empirically for approximate degrees? 
+        # Actually simpler: if nose is at eye, yaw is ~90.
+        # nose_off / (eye_width/2) = 1.0 => 90 deg?
+        if eye_width > 1e-5:
+            yaw = ((tn[0] - eye_mid_x) / (eye_width / 2)) * 60 # approx deg?
+        else:
+            yaw = 0
             
-        return False
+        # Pitch: Nose vertical position
+        # Eye mid Y
+        eye_mid_y = (tre[1] + tle[1]) / 2
+        mouth_mid_y = (trm[1] + tlm[1]) / 2
+        total_h = mouth_mid_y - eye_mid_y
+        nose_h = tn[1] - eye_mid_y
+        
+        if total_h > 1e-5:
+            ratio = nose_h / total_h
+            # Standard ratio is approx 0.35-0.4?
+            pitch = (ratio - 0.38) * 150 # scale factor
+        else:
+            pitch = 0
+            
+        return yaw, pitch, roll
 
     def estimate_pose(self, detection, w, h):
         """
@@ -293,10 +431,114 @@ class VideoProcessor:
         
         return yaw, pitch
 
+    def rotate_coords(self, coords, landmarks, rotation, w, h):
+        """
+        Map coordinates from a rotated frame back to original.
+        rotation: cv2.ROTATE_90_CLOCKWISE or cv2.ROTATE_90_COUNTERCLOCKWISE
+        w, h: Dimensions of the ORIGINAL frame (before rotation).
+        coords: (x1, y1, x2, y2)
+        landmarks: list of [x, y] or None
+        """
+        x1, y1, x2, y2 = coords
+        
+        def transform_point(pt):
+            x, y = pt
+            if rotation == cv2.ROTATE_90_CLOCKWISE:
+                # 90 CW: x' = h - 1 - y, y' = x
+                # Inverse: x = y', y = h - 1 - x'
+                # Here pt is (x', y') in rotated frame
+                # The rotated frame has width=h, height=w.
+                # FORMULA MAPS BACK TO ORIGINAL (w, h)
+                # x_orig = y_rot
+                # y_orig = h - 1 - x_rot
+                return [y, h - 1 - x]
+            elif rotation == cv2.ROTATE_90_COUNTERCLOCKWISE:
+                # 90 CCW: x' = y, y' = w - 1 - x
+                # Inverse: x = w - 1 - y', y = x'
+                # x_orig = w - 1 - y_rot
+                # y_orig = x_rot
+                return [w - 1 - y, x]
+            return [x, y]
+
+        p1 = transform_point((x1, y1))
+        p2 = transform_point((x2, y2))
+        p3 = transform_point((x1, y2))
+        p4 = transform_point((x2, y1))
+        
+        xs = [p1[0], p2[0], p3[0], p4[0]]
+        ys = [p1[1], p2[1], p3[1], p4[1]]
+        
+        lx1, lx2 = min(xs), max(xs)
+        ly1, ly2 = min(ys), max(ys)
+        
+        new_lms = None
+        if landmarks is not None:
+             new_lms = []
+             for lm in landmarks:
+                  new_lms.append(transform_point(lm))
+             new_lms = np.array(new_lms)
+             
+        return (int(lx1), int(ly1), int(lx2), int(ly2)), new_lms
+
     def detect_faces(self, frame, min_conf, max_angle=90):
         """
+        Multi-rotation wrapper for detection.
+        """
+        # If max_angle is high (e.g. > 60), assuming user wants to detect highly tilted faces.
+        # We run detection on 0, +90, -90.
+        # Otherwise just 0.
+        
+        # Pass 1: Original
+        detections = self._detect_single_pass(frame, min_conf, max_angle)
+        
+        if max_angle > 60 and len(detections) == 0:
+             h, w = frame.shape[:2]
+             
+             # Pass 2: 90 CW
+             frame_90 = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+             # Note: For rotated frame, "upright" face is actually tilted 90 in original.
+             # The filter inside _detect_single_pass filters by Yaw/Pitch.
+             # In rotated frame, Yaw/Pitch are naturally relative to the face's new "upright" orientation.
+             # So a 90-deg tilted face in Original is 0-deg in Rotated.
+             # _detect_single_pass WILL accept it (small yaw/pitch).
+             dets_90 = self._detect_single_pass(frame_90, min_conf, max_angle)
+             
+             for det in dets_90:
+                  x1, y1, x2, y2, conf, lms = det
+                  (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, cv2.ROTATE_90_CLOCKWISE, w, h)
+                  detections.append((rx1, ry1, rx2, ry2, conf, rlms))
+                  
+             # Pass 3: 90 CCW
+             frame_n90 = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+             dets_n90 = self._detect_single_pass(frame_n90, min_conf, max_angle)
+             
+             for det in dets_n90:
+                  x1, y1, x2, y2, conf, lms = det
+                  (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, cv2.ROTATE_90_COUNTERCLOCKWISE, w, h)
+                  detections.append((rx1, ry1, rx2, ry2, conf, rlms))
+             
+             # NMS to merge duplicates
+             if len(detections) > 1:
+                  boxes = []
+                  scores = []
+                  for d in detections:
+                       boxes.append([d[0], d[1], d[2]-d[0], d[3]-d[1]]) # x, y, w, h
+                       scores.append(float(d[4]))
+                  
+                  indices = cv2.dnn.NMSBoxes(boxes, scores, min_conf, 0.4)
+                  if len(indices) > 0:
+                       new_dets = []
+                       for i in indices.flatten():
+                            new_dets.append(detections[i])
+                       detections = new_dets
+        
+        return detections
+
+    def _detect_single_pass(self, frame, min_conf, max_angle=90):
+        """
         Unified detection method.
-        Returns list of (x1, y1, x2, y2, conf)
+        Returns list of (x1, y1, x2, y2, conf, landmarks)
+        landmarks: list of 5 (x,y) tuples or None.
         """
         detections = []
         
@@ -307,17 +549,40 @@ class VideoProcessor:
                 for pred in preds:
                     x1, y1, x2, y2, conf = pred
                     if conf >= min_conf:
-                        detections.append((int(x1), int(y1), int(x2), int(y2), conf))
+                        detections.append((int(x1), int(y1), int(x2), int(y2), conf, None))
                         
         elif self.model_type == 'yolo':
             results = self.model(frame, verbose=False, conf=min_conf)
             for result in results:
                 if result.boxes is not None:
                     boxes = result.boxes.data.cpu().numpy()
-                    for box in boxes:
+                    
+                    # Keypoints
+                    keypoints = None
+                    if hasattr(result, 'keypoints') and result.keypoints is not None:
+                         # Shape: [N, 5, 2] or [N, 5, 3] (conf)
+                         # We want [N, 5, 2]
+                         kps = result.keypoints.xy.cpu().numpy()
+                    
+                    for i, box in enumerate(boxes):
                         x1, y1, x2, y2 = map(int, box[:4])
                         conf = box[4]
-                        detections.append((x1, y1, x2, y2, conf))
+                        
+                        lms = None
+                        if keypoints is not None and i < len(keypoints):
+                             lms = keypoints[i] # 5 points (Ref: RightEye, LeftEye, Nose, RightMouth, LeftMouth)
+                        
+                        # Pose Filter for YOLO
+                        if lms is not None:
+                             yaw, pitch, roll = self.estimate_pose_from_landmarks(lms)
+                             # Filter Yaw/Pitch but ALLOW Roll (User wants up to 90 deg tilt)
+                             if abs(yaw) > max_angle: 
+                                  continue 
+                             # Pitch check (optional, usually less critical, but good to filter extreme looking up/down)
+                             if abs(pitch) > max_angle:
+                                  continue
+                        
+                        detections.append((x1, y1, x2, y2, conf, lms))
         
         elif self.model_type == 'mediapipe':
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -327,11 +592,6 @@ class VideoProcessor:
                 for detection in results.detections:
                     conf = detection.score[0]
                     if conf >= min_conf:
-                        # Check Angle
-                        yaw, pitch = self.estimate_pose(detection, w, h)
-                        if abs(yaw) > max_angle or abs(pitch) > max_angle:
-                            continue
-                            
                         bboxC = detection.location_data.relative_bounding_box
                         x1 = int(bboxC.xmin * w)
                         y1 = int(bboxC.ymin * h)
@@ -339,11 +599,119 @@ class VideoProcessor:
                         h_box = int(bboxC.height * h)
                         x2 = x1 + w_box
                         y2 = y1 + h_box
-                        detections.append((x1, y1, x2, y2, conf))
+                        
+                        # Landmarks
+                        kps = detection.location_data.relative_keypoints
+                        def gp(i): return [kps[i].x * w, kps[i].y * h]
+                        
+                        l_eye = gp(1)
+                        r_eye = gp(0)
+                        nose = gp(2)
+                        mouth = gp(3)
+                        
+                        # Fake mouth corners for 5-point
+                        d_eyes = np.linalg.norm(np.array(l_eye) - np.array(r_eye))
+                        l_mouth = [mouth[0] - d_eyes*0.25, mouth[1] + d_eyes*0.1]
+                        r_mouth = [mouth[0] + d_eyes*0.25, mouth[1] + d_eyes*0.1]
+                        
+                        lms = np.array([r_eye, l_eye, nose, r_mouth, l_mouth]) # Order: RE, LE, N, RM, LM
+                        
+                        # Check Angle with new estimator
+                        yaw, pitch, roll = self.estimate_pose_from_landmarks(lms)
+                        if abs(yaw) > max_angle or abs(pitch) > max_angle:
+                             continue
+                        
+                        detections.append((x1, y1, x2, y2, conf, lms))
                         
         return detections
 
-    def scan_video(self, video_path, min_conf, obstruction_threshold=0.0, obstruction_margin=0.0, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, progress_callback=None, preview_callback=None, stop_event=None):
+    def evaluate_face(self, frame, detection, target_gender, rec_threshold, min_face_quality, force_tilt_boost=False):
+        """
+        Evaluate a single face against criteria.
+        Returns: (passed_filters, low_quality_fail_only, details_dict)
+        low_quality_fail_only: True if face failed ONLY due to quality score.
+        """
+        x1, y1, x2, y2, conf, landmarks = detection
+        img_h, img_w = frame.shape[:2]
+        
+        passed = True
+        low_quality_fail = False
+        gender_label = ""
+        quality_score = 0.0
+        rec_score = 0.0
+        
+        # Gender
+        if target_gender != "All":
+             face_crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+             if face_crop.size > 0:
+                  gender = self.predict_gender(face_crop)
+                  gender_label += f" {gender}"
+                  if gender != target_gender:
+                       passed = False
+             else:
+                  passed = False
+                  
+        if not passed:
+             return False, False, {"label": gender_label, "quality": 0.0}
+
+        # Rec / Quality
+        if min_face_quality > 0 or self.reference_embedding is not None:
+             # Try alignment
+             align_img = None
+             if landmarks is not None:
+                  align_img = self.align_face(frame, landmarks)
+             
+             face_crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+             use_img = align_img if align_img is not None else face_crop
+             
+             if use_img is None or use_img.size == 0:
+                 use_img = face_crop
+                 
+             if use_img.size > 0:
+                 # Tilt Boost Calculation
+                 tilt_boost = 1.0
+                 should_boost = force_tilt_boost
+                 
+                 if not should_boost and landmarks is not None:
+                      _, _, roll = self.estimate_pose_from_landmarks(landmarks)
+                      if abs(roll) > 30:
+                           should_boost = True
+                 
+                 if should_boost:
+                      tilt_boost = 1.3
+                           
+                 emb, quality = self.get_embedding(use_img, tilt_boost=tilt_boost)
+                 quality_score = quality
+                 
+                 # Check Quality
+                 if min_face_quality > 0:
+                     gender_label += f" Q:{quality:.1f}"
+                     if quality < min_face_quality:
+                         passed = False
+                         low_quality_fail = True 
+                         
+                 # Check Rec
+                 if passed and self.reference_embedding is not None:
+                      sim = self.compute_sim(emb, self.reference_embedding)
+                      rec_score = sim
+                      gender_label += f" Sim:{sim:.2f}"
+                      if sim < rec_threshold:
+                           passed = False
+                           low_quality_fail = False # Failed Rec
+                           
+                 # If we failed Rec but Quality was OK, low_quality_fail is False.
+                 # If we failed Quality, we didn't check Rec (or passed became False).
+                 # Wait, if Quality fails, passed=False. Then Rec check... 
+                 # My logic above: if min_face_quality > 0 and quality < min: passed=False.
+                 # Then: if passed and Ref... -> passed is False so Rec check skipped.
+                 # This is correct. If Quality fails, we fail.
+                 
+             else:
+                 passed = False
+        
+        return passed, low_quality_fail, {"label": gender_label, "quality": quality_score}
+
+    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None):
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -369,37 +737,55 @@ class VideoProcessor:
             is_valid = False
             img_h, img_w, _ = frame.shape
             
-            for x1, y1, x2, y2, conf in detections:
-                face_passed = False
-                # Obstruction Check
-                if not self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin, obstruction_threshold):
-                    face_passed = True
-                    
-                # Check Gender if needed (and if face passed obstruction check)
-                if face_passed and target_gender != "All":
-                    # Crop face
-                    face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
-                    if face_img.size > 0:
-                        gender = self.predict_gender(face_img)
-                        if gender != target_gender:
-                            face_passed = False
-                    else:
-                        face_passed = False
+            low_qual_candidates = 0
+            
+            # Phase 1: Standard Evaluation
+            # We need to reconstruct the logic using evaluate_face
+            # But wait, evaluate_face recalculates everything. 
+            # We can just iterate detections.
+            
+            evaluated_detections = [] # Store (det, details, passed) for preview
+            
+            for det in detections:
+                 passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality)
+                 if passed:
+                      is_valid = True
+                 if low_qual_fail:
+                      low_qual_candidates += 1
+                 
+                 evaluated_detections.append((det, passed, details))
 
-                # Check Recognition if active
-                if face_passed and self.reference_embedding is not None:
-                    face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
-                    if face_img.size > 0:
-                        emb = self.get_embedding(face_img)
-                        sim = self.compute_sim(emb, self.reference_embedding)
-                        if sim < rec_threshold:
-                            face_passed = False
-                    else:
-                        face_passed = False
-
-                if face_passed:
-                    is_valid = True
-                    break
+            # Phase 2: Smart Rotation Retry
+            if not is_valid and low_qual_candidates > 0 and max_angle > 60 and min_face_quality > 0:
+                 # Retry with rotations
+                 h, w = frame.shape[:2]
+                 rotations = [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
+                 
+                 for rot in rotations:
+                      frame_rot = cv2.rotate(frame, rot)
+                      dets_rot = self._detect_single_pass(frame_rot, min_conf, max_angle)
+                      
+                      for d_rot in dets_rot:
+                           # Map back
+                           x1, y1, x2, y2, conf, lms = d_rot
+                           (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, rot, w, h)
+                           det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
+                           
+                           # CRITICAL FIX: Evaluate on the ROTATED frame (where face is upright)
+                           # This ensures alignment is clean and quality score is high.
+                           # Also FORCE the tilt boost, because we know it was tilted (that's why we rotated it).
+                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
+                           
+                           if passed:
+                                is_valid = True
+                                # Add ORIG coordinates to evaluated detections for preview drawing
+                                evaluated_detections.append((det_orig, passed, details))
+                                # Update main detections list for the loop below (preview)
+                                detections.append(det_orig)
+                                break
+                      
+                      if is_valid:
+                           break
             
             if is_valid:
                 valid_frames.append(frame_idx)
@@ -407,29 +793,32 @@ class VideoProcessor:
             # Preview Callback
             if preview_callback and frame_idx % 2 == 0:
                 annotated_frame = frame.copy()
-                for x1, y1, x2, y2, conf in detections:
-                    face_valid = True
-                    if self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin, obstruction_threshold):
-                        face_valid = False
-                    
-                    gender_label = ""
-                    if face_valid and self.reference_embedding is not None:
-                         face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
-                         if face_img.size > 0:
-                            emb = self.get_embedding(face_img)
-                            sim = self.compute_sim(emb, self.reference_embedding)
-                            gender_label += f" Sim:{sim:.2f}"
-                            if sim < rec_threshold:
-                                face_valid = False
+                
+                # If we succeeded in smart rotation, hide failed detections.
+                final_detections_to_draw = evaluated_detections
+                if is_valid and low_qual_candidates > 0:
+                     # Keep only valid ones
+                     valid_only = [d for d in evaluated_detections if d[1] == True]
+                     if valid_only:
+                          final_detections_to_draw = valid_only
 
-                    color = (0, 255, 0) if face_valid else (0, 0, 255)
-                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                    label = f"Conf: {conf:.2f}{gender_label}"
-                    cv2.putText(annotated_frame, label, (x1, y1 - 10), 
+                for det, face_passed, details in final_detections_to_draw:
+                     x1, y1, x2, y2, conf, landmarks = det
+                     
+                     color = (0, 255, 0) if face_passed else (0, 0, 255)
+                     cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                     
+                     label_text = f"Conf: {conf:.2f}"
+                     if "label" in details:
+                          label_text += details["label"]
+                     elif "quality" in details: 
+                          label_text += f" Q:{details['quality']:.1f}"
+                     
+                     cv2.putText(annotated_frame, label_text, (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
                 preview_callback(annotated_frame)
-            
+                         
             frame_idx += 1
 
         cap.release()
@@ -503,7 +892,7 @@ class VideoProcessor:
         except Exception as e:
             return False, f"Video editing error: {str(e)}"
 
-    def process_frame(self, frame, min_conf, obstruction_threshold=0.0, obstruction_margin=0.0, max_angle=90, target_gender="All", rec_threshold=0.5):
+    def process_frame(self, frame, min_conf, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0):
         """
         Process a single frame for preview.
         Returns: annotated_frame, is_valid_frame
@@ -514,20 +903,57 @@ class VideoProcessor:
         frame_valid = False
         img_h, img_w, _ = frame.shape
         
-        for x1, y1, x2, y2, conf in detections:
+        for x1, y1, x2, y2, conf, landmarks in detections:
             face_valid = True
-            if self.check_obstruction((x1, y1, x2, y2), img_w, img_h, obstruction_margin, obstruction_threshold):
-                face_valid = False
             
             gender_label = ""
-            if face_valid and self.reference_embedding is not None:
-                    face_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
-                    if face_img.size > 0:
-                        emb = self.get_embedding(face_img)
-                        sim = self.compute_sim(emb, self.reference_embedding)
-                        gender_label += f" Sim:{sim:.2f}"
-                        if sim < rec_threshold:
-                            face_valid = False
+            
+            # Combined Gender / Rec / Quality Check
+            needs_crop = (target_gender != "All") or (self.reference_embedding is not None) or (min_face_quality > 0)
+            
+            if face_valid and needs_crop:
+                    # Try alignment for Rec/Quality
+                    align_img = None
+                    if landmarks is not None:
+                         align_img = self.align_face(frame, landmarks)
+                    
+                    crop_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                    
+                    if crop_img.size > 0:
+                        # Gender (use crop, fast)
+                        if target_gender != "All":
+                             gender = self.predict_gender(crop_img)
+                             gender_label += f" {gender}"
+                             if gender != target_gender:
+                                 face_valid = False
+                        
+                        # Rec / Quality (use aligned if available, else crop)
+                        if self.reference_embedding is not None or min_face_quality > 0:
+                            use_img = align_img if align_img is not None else crop_img
+                            # Ensure use_img is valid
+                            if use_img is None or use_img.size == 0:
+                                use_img = crop_img
+
+                            if use_img.size > 0:
+                                # Tilt Boost
+                                tilt_boost = 1.0
+                                if landmarks is not None:
+                                     _, _, roll = self.estimate_pose_from_landmarks(landmarks)
+                                     if abs(roll) > 30:
+                                          tilt_boost = 1.1
+
+                                emb, quality = self.get_embedding(use_img, tilt_boost=tilt_boost)
+                                
+                                if min_face_quality > 0:
+                                    gender_label += f" Q:{quality:.1f}"
+                                    if quality < min_face_quality:
+                                        face_valid = False
+                                
+                                if self.reference_embedding is not None:
+                                    sim = self.compute_sim(emb, self.reference_embedding)
+                                    gender_label += f" Sim:{sim:.2f}"
+                                    if sim < rec_threshold:
+                                        face_valid = False
 
             if face_valid:
                 frame_valid = True
@@ -538,4 +964,82 @@ class VideoProcessor:
             cv2.putText(annotated_frame, label, (x1, y1 - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+        return annotated_frame, frame_valid
+
+    def process_frame_smart(self, frame, min_conf, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0):
+        """
+        Process a single frame for preview (Smart Rotation enabled).
+        Returns: annotated_frame, is_valid_frame
+        """
+        detections = self.detect_faces(frame, min_conf, max_angle)
+        
+        annotated_frame = frame.copy()
+        frame_valid = False
+        img_h, img_w, _ = frame.shape
+        
+        low_qual_candidates = 0
+        evaluated_detections = []
+        is_valid = False
+
+        # Phase 1: Standard Evaluation
+        for det in detections:
+             passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality)
+             if passed:
+                  is_valid = True
+             if low_qual_fail:
+                  low_qual_candidates += 1
+             
+             evaluated_detections.append((det, passed, details))
+             
+        # Phase 2: Smart Rotation Retry
+        if not is_valid and low_qual_candidates > 0 and max_angle > 60 and min_face_quality > 0:
+             # Retry with rotations
+             h, w = frame.shape[:2]
+             rotations = [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
+             
+             for rot in rotations:
+                  frame_rot = cv2.rotate(frame, rot)
+                  dets_rot = self._detect_single_pass(frame_rot, min_conf, max_angle)
+                  
+                  for d_rot in dets_rot:
+                       # Map back
+                       x1, y1, x2, y2, conf, lms = d_rot
+                       (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, rot, w, h)
+                       det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
+                       
+                       # Evaluate on ROTATED FRAME for best quality
+                       # Also FORCE the tilt boost, because we know it was tilted (that's why we rotated it).
+                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
+                       
+                       if passed:
+                            is_valid = True
+                            evaluated_detections.append((det_orig, passed, details))
+                            break
+                  
+                  if is_valid:
+                       break
+        
+        frame_valid = is_valid
+
+        # If we succeeded in smart rotation, hide failed detections.
+        final_detections_to_draw = evaluated_detections
+        if is_valid and low_qual_candidates > 0:
+             # Keep only valid ones
+             valid_only = [d for d in evaluated_detections if d[1] == True]
+             if valid_only:
+                  final_detections_to_draw = valid_only
+
+        for det, face_passed, details in final_detections_to_draw:
+            x1, y1, x2, y2, conf, landmarks = det
+            
+            color = (0, 255, 0) if face_passed else (0, 0, 255)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            
+            label_text = f"Conf: {conf:.2f}"
+            if "label" in details:
+                 label_text += details["label"]
+            
+            cv2.putText(annotated_frame, label_text, (x1, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
         return annotated_frame, frame_valid
