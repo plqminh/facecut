@@ -131,8 +131,7 @@ class VideoProcessor:
             return None, 0.0
 
         # Quality Metrics Calculation (Pre-normalization)
-        # sharpness, brightness = self.calculate_quality_metrics(face_img) # DISABLED by user request
-
+        
         # Alignment
         blob_input = face_img
         
@@ -782,10 +781,6 @@ class VideoProcessor:
                  
                  # REMOVED: Automatic boost based on roll. 
                  # We want strict evaluation. If it's tilted, Smart Rotation handles it.
-                 # if not should_boost and landmarks is not None:
-                 #      _, _, roll = self.estimate_pose_from_landmarks(landmarks)
-                 #      if abs(roll) > 30:
-                 #           should_boost = True
                  
                  if should_boost:
                       tilt_boost = 1.3
@@ -882,7 +877,7 @@ class VideoProcessor:
                            det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
                            
                            # Evaluate on the ROTATED frame (where face is upright)
-                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=False)
+                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
                            
                            if passed:
                                 is_valid = True
@@ -1048,10 +1043,6 @@ class VideoProcessor:
                             if use_img.size > 0:
                                 # Tilt Boost - DISABLE for consistency with strict check
                                 tilt_boost = 1.0
-                                # if landmarks is not None:
-                                #      _, _, roll = self.estimate_pose_from_landmarks(landmarks)
-                                #      if abs(roll) > 30:
-                                #           tilt_boost = 1.1
 
                                 emb, quality = self.get_embedding(use_img, tilt_boost=tilt_boost)
                                 
@@ -1119,7 +1110,7 @@ class VideoProcessor:
                        det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
                        
                        # Evaluate on ROTATED FRAME for best quality
-                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True, edge_margin=edge_margin)
+                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
                        
                        if passed:
                             is_valid = True

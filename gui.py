@@ -15,18 +15,29 @@ class FaceCutApp(ctk.CTk):
         super().__init__()
 
         self.title("FaceCut - YOLOv11 Strict Edition")
-        self.geometry("1300x700") # Increased width for 3 columns
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        w = int(screen_w * 0.85)
+        h = int(screen_h * 0.85)
+        # Ensure minimum usable size
+        w = max(1000, w)
+        h = max(600, h)
+        self.geometry(f"{w}x{h}")
+        
+        self.minsize(800, 500)
 
-        # Grid configuration: 0=Sidebar, 1=ClipList, 2=Preview
-        self.grid_columnconfigure(0, weight=0, minsize=250)
-        self.grid_columnconfigure(1, weight=0, minsize=300)
-        self.grid_columnconfigure(2, weight=1)
+        # Grid configuration: 0=Sidebar (Fixed/Scroll), 1=ClipList (Flex), 2=Preview (More Flex)
+        self.grid_columnconfigure(0, weight=0, minsize=260) # Sidebar slightly wider for scrollbar
+        self.grid_columnconfigure(1, weight=1, minsize=300) # Clip List expands
+        self.grid_columnconfigure(2, weight=3) # Preview expands more
         self.grid_rowconfigure(0, weight=1)
 
         # --- Left Sidebar (Controls) ---
-        self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0)
+        # Use ScrollableFrame to handle small screens/scaling
+        self.sidebar = ctk.CTkScrollableFrame(self, width=250, corner_radius=0, label_text="")
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(20, weight=1)
+        # Removing spacer weight to allow natural stacking in scroll view
+        # self.sidebar.grid_rowconfigure(20, weight=1)
 
         self.label_title = ctk.CTkLabel(self.sidebar, text="FaceCut AI", font=ctk.CTkFont(size=20, weight="bold"))
         self.label_title.grid(row=0, column=0, padx=20, pady=(20, 10))
