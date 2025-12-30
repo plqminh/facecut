@@ -775,41 +775,48 @@ class VideoProcessor:
                  use_img = face_crop
                  
              if use_img.size > 0:
-                 # Tilt Boost Calculation
-                 tilt_boost = 1.0
-                 should_boost = force_tilt_boost
+                 is_high_conf = (conf > 0.8)
                  
-                 # REMOVED: Automatic boost based on roll. 
-                 # We want strict evaluation. If it's tilted, Smart Rotation handles it.
+                 # Determine if we need to compute embedding
+                 # Case 1: Recognition is enabled (reference_embedding set) -> ALWAYS need embedding
+                 # Case 2: Recognition disabled, but Quality check needed AND NOT High Conf -> Need embedding
+                 need_embedding = (self.reference_embedding is not None) or (min_face_quality > 0 and not is_high_conf)
                  
-                 if should_boost:
-                      tilt_boost = 1.3
-                           
-                 emb, quality = self.get_embedding(use_img, tilt_boost=tilt_boost)
-                 quality_score = quality
-                 
-                 # Check Quality
-                 if min_face_quality > 0:
-                     gender_label += f" Q:{quality:.1f}"
-                     if quality < min_face_quality:
-                         passed = False
-                         low_quality_fail = True 
-                         
-                 # Check Rec
-                 if passed and self.reference_embedding is not None:
-                      sim = self.compute_sim(emb, self.reference_embedding)
-                      rec_score = sim
-                      gender_label += f" Sim:{sim:.2f}"
-                      if sim < rec_threshold:
-                           passed = False
-                           low_quality_fail = False # Failed Rec
-                           
-                 # If we failed Rec but Quality was OK, low_quality_fail is False.
-                 # If we failed Quality, we didn't check Rec (or passed became False).
-                 # Wait, if Quality fails, passed=False. Then Rec check... 
-                 # My logic above: if min_face_quality > 0 and quality < min: passed=False.
-                 # Then: if passed and Ref... -> passed is False so Rec check skipped.
-                 # This is correct. If Quality fails, we fail.
+                 if need_embedding:
+                     # Tilt Boost Calculation
+                     tilt_boost = 1.0
+                     should_boost = force_tilt_boost
+                     
+                     if should_boost:
+                          tilt_boost = 1.3
+                               
+                     emb, quality = self.get_embedding(use_img, tilt_boost=tilt_boost)
+                     quality_score = quality
+                     
+                     # Check Quality
+                     if min_face_quality > 0:
+                         if is_high_conf:
+                             # High Conf -> Pass automatically, just show score
+                             gender_label += f" Q:{quality:.1f}*"
+                         else:
+                             gender_label += f" Q:{quality:.1f}"
+                             if quality < min_face_quality:
+                                 passed = False
+                                 low_quality_fail = True 
+                             
+                     # Check Rec
+                     if passed and self.reference_embedding is not None:
+                          sim = self.compute_sim(emb, self.reference_embedding)
+                          rec_score = sim
+                          gender_label += f" Sim:{sim:.2f}"
+                          if sim < rec_threshold:
+                               passed = False
+                               low_quality_fail = False # Failed Rec
+                 else:
+                     # Skipped embedding calculation (High Conf + No Rec)
+                     if is_high_conf:
+                         gender_label += " Q:HighConf"
+                         # passed stays True
                  
              else:
                  passed = False
