@@ -75,6 +75,9 @@ class FaceCutApp(ctk.CTk):
         self.slider_duration.set(0.5)
         self.slider_duration.grid(row=16, column=0, padx=20, pady=(0, 10), sticky="ew")
 
+
+
+        # Max Angle Slider (MediaPipe only)
         # Max Angle Slider (MediaPipe only)
         self.lbl_angle = ctk.CTkLabel(self.sidebar, text="Max Angle: 45°")
         self.lbl_angle.grid(row=17, column=0, padx=20, pady=(10, 0), sticky="w")

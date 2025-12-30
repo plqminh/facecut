@@ -27,6 +27,9 @@ class VideoProcessor:
         self.rec_model = "w600k_mbf.onnx"
         self.reference_embedding = None
         
+        # FAN (Face Alignment Network) for Strict Validation
+        self.fan = None
+        
         self.ensure_models()
         self.load_models()
         
@@ -47,6 +50,20 @@ class VideoProcessor:
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
+
+    def ensure_fan(self):
+        if self.fan is None:
+            print("Loading FAN (Face Alignment Network) for strict validation...")
+            try:
+                # Use CPU/Cuda based on avail. '2D' landmarks.
+                self.fan = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, 
+                                                      device=self.device, 
+                                                      face_detector='blazeface') # Use lightweight internal detector?
+                                                      # Actually we pass the rect, so detector matters less, but blazeface is standard.
+                print("FAN loaded.")
+            except Exception as e:
+                print(f"Failed to load FAN: {e}")
+                
     def ensure_models(self):
         # Gender
         if not os.path.exists(self.gender_model):
@@ -107,46 +124,14 @@ class VideoProcessor:
 
 
 
-    def calculate_quality_metrics(self, face_img):
-        """
-        Calculate Sharpness (Laplacian Var) and Brightness with masking.
-        - Brightness: Ignored black padding (0 pixels).
-        - Sharpness: Calculated on Central ROI to avoid border artifacts.
-        Returns: sharpness, brightness
-        """
-        if face_img.size == 0:
-            return 0, 0
-            
-        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-        
-        # Mask: Ignore purely black pixels (padding from alignment)
-        mask = gray > 1
-        if np.count_nonzero(mask) == 0:
-            return 0, 0
-            
-        # Brightness: Mean of Valid Pixels only
-        brightness = np.mean(gray[mask])
-        
-        # Sharpness: Use Center Crop (50%) to avoid border edges
-        h, w = gray.shape
-        cy, cx = h // 2, w // 2
-        # Crop 50% from center
-        h4, w4 = h // 4, w // 4
-        roi = gray[cy - h4 : cy + h4, cx - w4 : cx + w4]
-        
-        if roi.size > 0:
-             sharpness = cv2.Laplacian(roi, cv2.CV_64F).var()
-        else:
-             sharpness = 0
-        
-        return sharpness, brightness
+
 
     def get_embedding(self, face_img, landmarks=None, tilt_boost=1.0):
         if self.rec_net is None:
             return None, 0.0
 
         # Quality Metrics Calculation (Pre-normalization)
-        sharpness, brightness = self.calculate_quality_metrics(face_img)
+        # sharpness, brightness = self.calculate_quality_metrics(face_img) # DISABLED by user request
 
         # Alignment
         blob_input = face_img
@@ -170,35 +155,11 @@ class VideoProcessor:
         # Quality Score (Feature Norm)
         feature_norm = np.linalg.norm(embedding)
         
-        # Composite Quality Score
-        # Start with Feature Norm (proxy for "face-ness" and detail)
+        # Composite Quality Score (FAN ONLY Mode)
+        # We rely solely on FAN validation (done in evaluate_face) + Raw Feature Norm.
+        # No penalties for blur, brightness, or padding.
         composite_score = feature_norm
         
-        # Penalty 1: Sharpness (Blur)
-        # Adaptive thresholds for tilted faces
-        sharp_thresh_low = 30
-        sharp_thresh_high = 60
-        
-        if tilt_boost > 1.0:
-            # Relaxed thresholds for tilted faces (cubic interp softens edges)
-            sharp_thresh_low = 20
-            sharp_thresh_high = 40
-
-        if sharpness < sharp_thresh_low:
-            composite_score *= 0.5
-        elif sharpness < sharp_thresh_high:
-            composite_score *= 0.8
-            
-        # Penalty 2: Brightness (Exposure)
-        # Range 0-255. <30 is dark, >230 is washed out.
-        if brightness < 30 or brightness > 230:
-            composite_score *= 0.6
-            
-        # Tilt Boost
-        if tilt_boost > 1.0:
-            # Stronger boost for tilted faces to ensure robustness
-            composite_score *= 1.3
-            
         # Normalize the embedding vector
         norm_embedding = embedding / (feature_norm + 1e-5)
         
@@ -206,13 +167,80 @@ class VideoProcessor:
 
     def align_face(self, img, landmarks):
         """
-        Align face using 5-point landmarks to standard ArcFace template (112x112).
-        Landmarks: list/array of 5 points [(x,y), ...].
+        Align face using landmarks to standard ArcFace template (112x112).
+        Landmarks: list/array of 5 points OR 68 points.
         Returns: aligned_img (112, 112, 3)
         """
-        if landmarks is None or len(landmarks) != 5:
-            # Fallback for unexpected landmark count
+        if landmarks is None:
             return None
+            
+        landmarks = np.array(landmarks)
+        
+        if len(landmarks) == 68:
+            # Convert 68-point DLIB to 5-point ArcFace
+            # 36-41: Right Eye, 42-47: Left Eye, 30: Nose, 48: R Mouth, 54: L Mouth
+            # Note: FAN uses 0-indexed logic matching dlib
+            
+            # Left Eye (average of 36-41) -> Image coords
+            # Wait, 36-41 is Right Eye in typical Medical terms (Patient Right), but Image Left?
+            # Standard Dlib: 36..41 is LEFT EYE (User View Left, Patient Right). 42..47 is RIGHT EYE.
+            # ArcFace expects: [RightEye, LeftEye, Nose, RightMouth, LeftMouth] (Image Coords)
+            # Dlib 36 (outer left) -> 39 (inner left). 
+            # Dlib 42 (inner right) -> 45 (outer right).
+            
+            # Let's verify standard 5 point:
+            # Image Left Eye (Patient Right), Image Right Eye
+            # ArcFace ref points look like: [38, 51] (Left/Right?), [73, 51] ...
+            # 38 is x (Left), 73 is x (Right). So Index 0 is LEFT eye (Image Left).
+            # WAIT. Let's check my 'detect_faces' MediaPipe mapping:
+            # lms = [r_eye, l_eye, nose, r_mouth, l_mouth]
+            # r_eye (Image Right, i.e. patient left) - NO.
+            # MediaPipe 0=RightEye (Patient Right), 1=LeftEye (Patient Left).
+            # "Right Eye" usually means Patient Right (Image Left).
+            # Let's check coordinates.
+            # src[0] = [38, 51] -> x=38 (Image Left). So Index 0 is IMAGE LEFT EYE.
+            # src[1] = [73, 51] -> x=73 (Image Right). So Index 1 is IMAGE RIGHT EYE.
+            
+            # My MediaPipe map:
+            # gp(0) is Right Eye (Patient Right / Image Left).
+            # So my 5-point array is [ImageLeftEye, ImageRightEye, Nose, ImageLeftMouth, ImageRightMouth] ??
+            # ArcFace src expects: [RightEye??, LeftEye??, ... ] 
+            # Actually standard Insightface is:
+            # 0: Left Eye (Image Left)
+            # 1: Right Eye (Image Right)
+            # 2: Nose
+            # 3: Left Mouth Corner (Image Left)
+            # 4: Right Mouth Corner (Image Right)
+            
+            # Let's map 68 points to this order:
+            # 0 (ImgLeftEye): Mean(36...41)
+            # 1 (ImgRightEye): Mean(42...47)
+            # 2 (Nose): 30
+            # 3 (ImgLeftMouth): 48 
+            # 4 (ImgRightMouth): 54
+            
+            le_idxs = list(range(36, 42))
+            re_idxs = list(range(42, 48))
+            
+            img_le = np.mean(landmarks[le_idxs], axis=0) # Image Left Eye
+            img_re = np.mean(landmarks[re_idxs], axis=0) # Image Right Eye
+            nose = landmarks[30]
+            img_lm = landmarks[48] # Left Mouth Corner
+            img_rm = landmarks[54] # Right Mouth Corner
+            
+            # Check my Processor 5-point order:
+            # src array: [38, 51] (Left), [73, 51] (Right)
+            # So yes, 0=Left, 1=Right.
+            
+            dst = np.array([img_le, img_re, nose, img_lm, img_rm], dtype=np.float32)
+
+        elif len(landmarks) == 5:
+             # Assumed order: [ImageLeftEye, ImageRightEye, Nose, ImageLeftMouth, ImageRightMouth]
+             # Note: My Mediapipe wrapper had: [r_eye(0), l_eye(1)...]
+             # MP 0 is Right Eye (Patient Right -> Image Left). Correct.
+             dst = np.array(landmarks, dtype=np.float32)
+        else:
+             return None
             
         # Standard ArcFace 112x112 reference points
         src = np.array([
@@ -222,13 +250,17 @@ class VideoProcessor:
             [41.5493, 92.3655],
             [70.7299, 92.2041] ], dtype=np.float32)
             
-        dst = np.array(landmarks, dtype=np.float32)
+        # dst is already defined above as 5 points
         
         # Estimate affine transform
-        tform = cv2.estimateAffinePartial2D(dst, src, method=cv2.LMEDS)[0]
-        if tform is None:
-             # Fallback to simple affine if LMEDS fails
-             tform = cv2.estimateAffinePartial2D(dst, src)[0]
+        try:
+             tform = cv2.estimateAffinePartial2D(dst, src, method=cv2.LMEDS)[0]
+             if tform is None:
+                  # Fallback to simple affine if LMEDS fails
+                  tform = cv2.estimateAffinePartial2D(dst, src)[0]
+        except Exception as e:
+             print(f"Align Error: {e}")
+             return None
              
         if tform is None:
             return None
@@ -307,13 +339,60 @@ class VideoProcessor:
 
     def estimate_pose_from_landmarks(self, landmarks):
         """
-        Estimate Yaw, Pitch, Roll from 5 landmarks (Image coords).
+        Estimate Yaw, Pitch, Roll from 5 landmarks OR 68-point landmarks.
         Landmarks: [RightEye, LeftEye, Nose, RightMouth, LeftMouth] (Image coords)
+                   OR 68-point array.
         Returns: yaw, pitch, roll (degrees)
         """
-        if landmarks is None or len(landmarks) != 5:
+        landmarks = np.array(landmarks)
+        
+        if len(landmarks) == 68:
+             # Extract 5 points from 68 for pose estimation
+             le_idxs = list(range(36, 42))
+             re_idxs = list(range(42, 48))
+             
+             img_le = np.mean(landmarks[le_idxs], axis=0)
+             img_re = np.mean(landmarks[re_idxs], axis=0)
+             nose = landmarks[30]
+             img_lm = landmarks[48]
+             img_rm = landmarks[54]
+             
+             # Convert to 5-point standard array: [RE, LE, N, RM, LM]
+             # Note: 'RE' in standard pose estimator usually means Image Left (Patient Right)?
+             # Check logic below:
+             # It uses P3P solver. It expects 3D model points.
+             # self.model_points correspond to:
+             # 0: Nose (0.0, 0.0, 0.0) -> Index 2
+             # 1: Chin (0.0, -330.0, -65.0) -> Not in 5 point
+             # 2: Left Eye (-225.0, 170.0, -135.0) -> Index 1
+             # 3: Right Eye (225.0, 170.0, -135.0) -> Index 0
+             # 4: Left Mouth (-150.0, -150.0, -125.0) -> Index 4
+             # 5: Right Mouth (150.0, -150.0, -125.0) -> Index 3
+             
+             # So we need to feed: [RightEye, LeftEye, Nose, RightMouth, LeftMouth]
+             # My variables: img_re (Image Right / Patient Left), img_le (Image Left / Patient Right)
+             # Wait, my dlib logic: 
+             # le_idxs (36-41) -> Image Left (Patient Right)
+             # re_idxs (42-47) -> Image Right (Patient Left)
+             
+             # If pose model expects Index 0 = Right Eye (225.0 ...).
+             # +X is usually Right.
+             # So Index 0 is Image Right (Patient Left)?
+             
+             # Let's verify standard heuristics.
+             # re = landmarks[0]. le = landmarks[1].
+             # code: dx = le[0] - re[0]. 
+             # If expected roll 0: dx should be positive (le.x > re.x).
+             # So le must be Image Right. re must be Image Left.
+             # My variables: img_le = Image Left (Patient Right). img_re = Image Right (Patient Left).
+             # So re(index 0) should be img_le. le(index 1) should be img_re.
+             
+             # Order: [ImageLeft, ImageRight, Nose, ImageLeftMouth, ImageRightMouth]
+             lms_5 = np.array([img_le, img_re, nose, img_lm, img_rm], dtype=np.float32)
+             landmarks = lms_5
+        elif landmarks is None or len(landmarks) != 5:
             return 0, 0, 0
-
+            
         re = landmarks[0]
         le = landmarks[1]
         nose = landmarks[2]
@@ -625,6 +704,8 @@ class VideoProcessor:
                         
         return detections
 
+
+
     def evaluate_face(self, frame, detection, target_gender, rec_threshold, min_face_quality, force_tilt_boost=False):
         """
         Evaluate a single face against criteria.
@@ -633,6 +714,33 @@ class VideoProcessor:
         """
         x1, y1, x2, y2, conf, landmarks = detection
         img_h, img_w = frame.shape[:2]
+        
+        # FAN Enhancement (Strict Mode)
+        if min_face_quality > 0:
+             # 1. Validation: Use FAN to confirm it's a valid face and refine landmarks
+             self.ensure_fan()
+             # We need to crop roughly to feed FAN detection with existing box hint.
+             # Actually FAN takes image and face_rects.
+             # FaceAlignment.get_landmarks(image, detected_faces=[(x1, y1, x2, y2)])
+             
+             try:
+                  # Convert to RGB only once if needed? 
+                  # Actually detected_faces arg in get_landmarks makes it efficient.
+                  rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                  
+                  preds = self.fan.get_landmarks(rgb, detected_faces=[(x1, y1, x2, y2)])
+                  
+                  if preds is None or len(preds) == 0:
+                       # FAN Failed -> Bad Face Structure
+                       return False, False, {"label": " NoStruct", "quality": 0.0}
+                  
+                  # FAN Succeeded -> Use refined landmarks
+                  landmarks = preds[0] # 68 points
+                  
+             except Exception as e:
+                  print(f"FAN Error: {e}")
+                  # Fallback or strict fail? Let's strict fail to be safe.
+                  return False, False, {"label": " FanErr", "quality": 0.0}
         
         passed = True
         low_quality_fail = False
@@ -672,10 +780,12 @@ class VideoProcessor:
                  tilt_boost = 1.0
                  should_boost = force_tilt_boost
                  
-                 if not should_boost and landmarks is not None:
-                      _, _, roll = self.estimate_pose_from_landmarks(landmarks)
-                      if abs(roll) > 30:
-                           should_boost = True
+                 # REMOVED: Automatic boost based on roll. 
+                 # We want strict evaluation. If it's tilted, Smart Rotation handles it.
+                 # if not should_boost and landmarks is not None:
+                 #      _, _, roll = self.estimate_pose_from_landmarks(landmarks)
+                 #      if abs(roll) > 30:
+                 #           should_boost = True
                  
                  if should_boost:
                       tilt_boost = 1.3
@@ -771,16 +881,12 @@ class VideoProcessor:
                            (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, rot, w, h)
                            det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
                            
-                           # CRITICAL FIX: Evaluate on the ROTATED frame (where face is upright)
-                           # This ensures alignment is clean and quality score is high.
-                           # Also FORCE the tilt boost, because we know it was tilted (that's why we rotated it).
-                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
+                           # Evaluate on the ROTATED frame (where face is upright)
+                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=False)
                            
                            if passed:
                                 is_valid = True
-                                # Add ORIG coordinates to evaluated detections for preview drawing
                                 evaluated_detections.append((det_orig, passed, details))
-                                # Update main detections list for the loop below (preview)
                                 detections.append(det_orig)
                                 break
                       
@@ -827,7 +933,12 @@ class VideoProcessor:
             return [], "No valid frames found matching criteria."
 
         # Merge frames into clips
-        gap_tolerance = int(fps * 0.5) 
+        if min_face_quality > 0:
+             # Strict Mode: Very low tolerance for gaps aka blurry frames
+             gap_tolerance = 1 
+        else:
+             # Standard Mode: Allow small dropouts
+             gap_tolerance = int(fps * 0.5) 
         
         segments = []
         if valid_frames:
@@ -935,12 +1046,12 @@ class VideoProcessor:
                                 use_img = crop_img
 
                             if use_img.size > 0:
-                                # Tilt Boost
+                                # Tilt Boost - DISABLE for consistency with strict check
                                 tilt_boost = 1.0
-                                if landmarks is not None:
-                                     _, _, roll = self.estimate_pose_from_landmarks(landmarks)
-                                     if abs(roll) > 30:
-                                          tilt_boost = 1.1
+                                # if landmarks is not None:
+                                #      _, _, roll = self.estimate_pose_from_landmarks(landmarks)
+                                #      if abs(roll) > 30:
+                                #           tilt_boost = 1.1
 
                                 emb, quality = self.get_embedding(use_img, tilt_boost=tilt_boost)
                                 
@@ -1008,8 +1119,7 @@ class VideoProcessor:
                        det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
                        
                        # Evaluate on ROTATED FRAME for best quality
-                       # Also FORCE the tilt boost, because we know it was tilted (that's why we rotated it).
-                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
+                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True, edge_margin=edge_margin)
                        
                        if passed:
                             is_valid = True
