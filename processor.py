@@ -775,12 +775,10 @@ class VideoProcessor:
                  use_img = face_crop
                  
              if use_img.size > 0:
-                 is_high_conf = (conf > 0.8)
-                 
-                 # Determine if we need to compute embedding
+                # Determine if we need to compute embedding
                  # Case 1: Recognition is enabled (reference_embedding set) -> ALWAYS need embedding
-                 # Case 2: Recognition disabled, but Quality check needed AND NOT High Conf -> Need embedding
-                 need_embedding = (self.reference_embedding is not None) or (min_face_quality > 0 and not is_high_conf)
+                 # Case 2: Recognition disabled, but Quality check needed -> Need embedding
+                 need_embedding = (self.reference_embedding is not None) or (min_face_quality > 0)
                  
                  if need_embedding:
                      # Tilt Boost Calculation
@@ -795,14 +793,10 @@ class VideoProcessor:
                      
                      # Check Quality
                      if min_face_quality > 0:
-                         if is_high_conf:
-                             # High Conf -> Pass automatically, just show score
-                             gender_label += f" Q:{quality:.1f}*"
-                         else:
-                             gender_label += f" Q:{quality:.1f}"
-                             if quality < min_face_quality:
-                                 passed = False
-                                 low_quality_fail = True 
+                         gender_label += f" Q:{quality:.1f}"
+                         if quality < min_face_quality:
+                             passed = False
+                             low_quality_fail = True 
                              
                      # Check Rec
                      if passed and self.reference_embedding is not None:
@@ -812,11 +806,6 @@ class VideoProcessor:
                           if sim < rec_threshold:
                                passed = False
                                low_quality_fail = False # Failed Rec
-                 else:
-                     # Skipped embedding calculation (High Conf + No Rec)
-                     if is_high_conf:
-                         gender_label += " Q:HighConf"
-                         # passed stays True
                  
              else:
                  passed = False
