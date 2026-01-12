@@ -812,13 +812,21 @@ class VideoProcessor:
         
         return passed, low_quality_fail, {"label": gender_label, "quality": quality_score}
 
-    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None):
+    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None, start_time=0.0):
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # Calculate start frame from start_time
+        start_frame = int(start_time * fps) if start_time > 0 else 0
+        start_frame = min(start_frame, total_frames - 1)  # Clamp to valid range
+        
+        # Seek to start position if needed
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
         valid_frames = []
-        frame_idx = 0
+        frame_idx = start_frame
         
         while cap.isOpened():
             if stop_event and stop_event.is_set():
@@ -830,7 +838,11 @@ class VideoProcessor:
                 break
 
             if progress_callback and frame_idx % 10 == 0:
-                progress_callback(frame_idx / total_frames)
+                # Calculate progress based on frames remaining after start point
+                frames_to_process = total_frames - start_frame
+                frames_processed = frame_idx - start_frame
+                progress = frames_processed / frames_to_process if frames_to_process > 0 else 1.0
+                progress_callback(progress)
 
             # Run inference
             detections = self.detect_faces(frame, min_conf, max_angle)

@@ -86,52 +86,66 @@ class FaceCutApp(ctk.CTk):
         self.slider_duration.set(0.5)
         self.slider_duration.grid(row=16, column=0, padx=20, pady=(0, 10), sticky="ew")
 
+        # Start Time Entry
+        self.lbl_start_time = ctk.CTkLabel(self.sidebar, text="Start Time (seconds)")
+        self.lbl_start_time.grid(row=17, column=0, padx=20, pady=(10, 0), sticky="w")
+        
+        self.start_time_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.start_time_frame.grid(row=18, column=0, padx=20, pady=(0, 10), sticky="ew")
+        
+        self.entry_start_time = ctk.CTkEntry(self.start_time_frame, width=80, placeholder_text="0")
+        self.entry_start_time.pack(side="left")
+        self.entry_start_time.insert(0, "0")
+        
+        self.btn_set_current_time = ctk.CTkButton(self.start_time_frame, text="Use Current", width=90, 
+                                                   command=self.set_start_time_from_playhead)
+        self.btn_set_current_time.pack(side="left", padx=5)
 
 
-        # Max Angle Slider (MediaPipe only)
-        # Max Angle Slider (MediaPipe only)
+
+        # Max Angle Slider
         self.lbl_angle = ctk.CTkLabel(self.sidebar, text="Max Angle: 45°")
-        self.lbl_angle.grid(row=17, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_angle.grid(row=19, column=0, padx=20, pady=(10, 0), sticky="w")
         self.slider_angle = ctk.CTkSlider(self.sidebar, from_=10, to=90, number_of_steps=80, command=self.update_angle_label)
         self.slider_angle.set(45)
-        self.slider_angle.grid(row=18, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_angle.grid(row=20, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Gender Selection
         self.lbl_gender = ctk.CTkLabel(self.sidebar, text="Keep Gender")
-        self.lbl_gender.grid(row=19, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_gender.grid(row=21, column=0, padx=20, pady=(10, 0), sticky="w")
         self.combo_gender = ctk.CTkComboBox(self.sidebar, values=["All", "Male", "Female"])
         self.combo_gender.set("All")
-        self.combo_gender.grid(row=20, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.combo_gender.grid(row=22, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Face Recognition
         self.lbl_rec = ctk.CTkLabel(self.sidebar, text="Face Recognition")
-        self.lbl_rec.grid(row=21, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_rec.grid(row=23, column=0, padx=20, pady=(10, 0), sticky="w")
         
         self.btn_ref_face = ctk.CTkButton(self.sidebar, text="Set Ref Face", command=self.set_reference_face)
-        self.btn_ref_face.grid(row=22, column=0, padx=20, pady=(5, 5), sticky="ew")
+        self.btn_ref_face.grid(row=24, column=0, padx=20, pady=(5, 5), sticky="ew")
         
         self.lbl_ref_status = ctk.CTkLabel(self.sidebar, text="No Ref Face", font=ctk.CTkFont(size=10))
-        self.lbl_ref_status.grid(row=23, column=0, padx=20, pady=(0, 5))
+        self.lbl_ref_status.grid(row=25, column=0, padx=20, pady=(0, 5))
         
         self.lbl_sim = ctk.CTkLabel(self.sidebar, text="Sim Threshold: 0.50")
-        self.lbl_sim.grid(row=24, column=0, padx=20, pady=(5, 0), sticky="w")
+        self.lbl_sim.grid(row=26, column=0, padx=20, pady=(5, 0), sticky="w")
         
         self.slider_sim = ctk.CTkSlider(self.sidebar, from_=0.1, to=1.0, number_of_steps=90, command=self.update_sim_label)
         self.slider_sim.set(0.5)
-        self.slider_sim.grid(row=25, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_sim.grid(row=27, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         self.btn_process = ctk.CTkButton(self.sidebar, text="Start Processing", command=self.start_processing, state="disabled", fg_color="green")
-        self.btn_process.grid(row=26, column=0, padx=20, pady=(20, 10))
+        self.btn_process.grid(row=28, column=0, padx=20, pady=(20, 10))
 
         self.btn_stop = ctk.CTkButton(self.sidebar, text="Stop", command=self.stop_processing, state="disabled", fg_color="red")
-        self.btn_stop.grid(row=27, column=0, padx=20, pady=(0, 10))
+        self.btn_stop.grid(row=29, column=0, padx=20, pady=(0, 10))
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar)
-        self.progress_bar.grid(row=28, column=0, padx=20, pady=10, sticky="ew")
+        self.progress_bar.grid(row=30, column=0, padx=20, pady=10, sticky="ew")
         self.progress_bar.set(0)
 
         self.lbl_status = ctk.CTkLabel(self.sidebar, text="Ready")
-        self.lbl_status.grid(row=29, column=0, padx=20, pady=10)
+        self.lbl_status.grid(row=31, column=0, padx=20, pady=10)
 
 
         # --- Middle Column (Clip List) ---
@@ -231,6 +245,21 @@ class FaceCutApp(ctk.CTk):
     
     def update_duration_label(self, value):
         self.lbl_duration.configure(text=f"Min Duration: {value:.1f}s")
+
+    def set_start_time_from_playhead(self):
+        """Set the start time entry to the current playhead position."""
+        if self.cap and self.fps > 0:
+            current_time = self.current_frame_idx / self.fps
+            self.entry_start_time.delete(0, "end")
+            self.entry_start_time.insert(0, f"{current_time:.1f}")
+
+    def get_start_time(self):
+        """Get the start time in seconds from the entry field."""
+        try:
+            value = float(self.entry_start_time.get())
+            return max(0, value)
+        except ValueError:
+            return 0.0
 
     def update_angle_label(self, value):
         self.lbl_angle.configure(text=f"Max Angle: {int(value)}°")
@@ -379,12 +408,13 @@ class FaceCutApp(ctk.CTk):
         target_gender = self.combo_gender.get()
         rec_thresh = self.slider_sim.get()
         min_quality = self.slider_quality.get()
+        start_time = self.get_start_time()
         self.stop_event.clear()
 
         # Clear existing clips
         self.clear_clip_list()
 
-        threading.Thread(target=self.run_processing, args=(min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality)).start()
+        threading.Thread(target=self.run_processing, args=(min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality, start_time)).start()
 
     def stop_processing(self):
         self.stop_event.set()
@@ -444,7 +474,7 @@ class FaceCutApp(ctk.CTk):
         self.start_rendering(selected_segments)
 
 
-    def run_processing(self, min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality):
+    def run_processing(self, min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality, start_time=0.0):
         try:
             # Phase 1: Scan
             def update_prog(p):
@@ -484,7 +514,8 @@ class FaceCutApp(ctk.CTk):
                 min_face_quality=min_quality,
                 progress_callback=update_prog,
                 preview_callback=update_preview,
-                stop_event=self.stop_event
+                stop_event=self.stop_event,
+                start_time=start_time
             )
 
             if segments is None: # Stopped
@@ -574,7 +605,8 @@ class FaceCutApp(ctk.CTk):
                     "max_angle": self.slider_angle.get(),
                     "min_face_quality": self.slider_quality.get(),
                     "target_gender": self.combo_gender.get(),
-                    "rec_threshold": self.slider_sim.get() 
+                    "rec_threshold": self.slider_sim.get(),
+                    "start_time": self.get_start_time()
                 }
             }
             with open(json_path, 'w') as f:
@@ -617,6 +649,9 @@ class FaceCutApp(ctk.CTk):
                     if "rec_threshold" in params:
                         self.slider_sim.set(params["rec_threshold"])
                         self.update_sim_label(params["rec_threshold"])
+                    if "start_time" in params:
+                        self.entry_start_time.delete(0, "end")
+                        self.entry_start_time.insert(0, str(params["start_time"]))
 
                 self.lbl_status.configure(text=f"Loaded {len(data['segments'])} saved clips")
         except Exception as e:
