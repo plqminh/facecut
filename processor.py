@@ -316,22 +316,95 @@ class VideoProcessor:
                 
         return False, "Could not process reference face"
 
-    def predict_gender(self, face_img):
+    def predict_gender(self, face_img, aligned_img=None):
+        """
+        Robust gender prediction using test-time augmentation.
+        Uses horizontal flip + multi-scale + optional aligned face for voting.
+        Returns: (gender_string, confidence) or just gender_string for backward compat.
+        """
         if self.gender_net is None:
             return "Unknown"
         
-        # InsightFace GenderAge Preprocessing
-        # Resize to 96x96
-        # Mean 127.5, Scale 1/128.0 (approx 0.0078125)
-        # RGB (swapRB=True because OpenCV is BGR)
-        blob = cv2.dnn.blobFromImage(face_img, 1.0/128.0, (96, 96), 
-                                   (127.5, 127.5, 127.5), 
-                                   swapRB=True, crop=False)
-        self.gender_net.setInput(blob)
-        preds = self.gender_net.forward()
-        # Output shape is (1, 3). [0, 1] are gender logits.
-        # 0 -> Female, 1 -> Male
-        gender_idx = np.argmax(preds[0][:2])
+        if face_img is None or face_img.size == 0:
+            return "Unknown"
+            
+        # Collect all predictions (logits) for averaging
+        all_logits = []
+        
+        def run_inference(img):
+            """Run single inference and return gender logits."""
+            if img is None or img.size == 0:
+                return None
+            try:
+                # InsightFace GenderAge Preprocessing
+                # Resize to 96x96, Mean 127.5, Scale 1/128.0, RGB
+                blob = cv2.dnn.blobFromImage(img, 1.0/128.0, (96, 96), 
+                                           (127.5, 127.5, 127.5), 
+                                           swapRB=True, crop=False)
+                self.gender_net.setInput(blob)
+                preds = self.gender_net.forward()
+                # Output shape is (1, 3). [0, 1] are gender logits.
+                return preds[0][:2]
+            except Exception:
+                return None
+        
+        # 1. Original face crop
+        logits = run_inference(face_img)
+        if logits is not None:
+            all_logits.append(logits)
+        
+        # 2. Horizontal flip (mirrors potential pose asymmetry)
+        flipped = cv2.flip(face_img, 1)
+        logits = run_inference(flipped)
+        if logits is not None:
+            all_logits.append(logits)
+        
+        # 3. Slight scale variations (0.9x and 1.1x center crop effect)
+        h, w = face_img.shape[:2]
+        if h > 20 and w > 20:
+            # 0.9x - center crop
+            margin_h, margin_w = int(h * 0.05), int(w * 0.05)
+            cropped = face_img[margin_h:h-margin_h, margin_w:w-margin_w]
+            logits = run_inference(cropped)
+            if logits is not None:
+                all_logits.append(logits)
+            
+            # Flipped center crop
+            cropped_flip = cv2.flip(cropped, 1)
+            logits = run_inference(cropped_flip)
+            if logits is not None:
+                all_logits.append(logits)
+        
+        # 4. If aligned face is provided, use it (best quality input)
+        if aligned_img is not None and aligned_img.size > 0:
+            logits = run_inference(aligned_img)
+            if logits is not None:
+                all_logits.append(logits * 1.5)  # Weight aligned face higher
+            
+            # Flipped aligned
+            aligned_flip = cv2.flip(aligned_img, 1)
+            logits = run_inference(aligned_flip)
+            if logits is not None:
+                all_logits.append(logits * 1.5)
+        
+        if len(all_logits) == 0:
+            return "Unknown"
+        
+        # Average all logits
+        avg_logits = np.mean(all_logits, axis=0)
+        
+        # Softmax for confidence
+        exp_logits = np.exp(avg_logits - np.max(avg_logits))
+        probs = exp_logits / np.sum(exp_logits)
+        
+        gender_idx = np.argmax(avg_logits)
+        confidence = probs[gender_idx]
+        
+        # If confidence is too low, return Unknown
+        # Threshold ~0.6 means model is fairly uncertain
+        if confidence < 0.55:
+            return "Unknown"
+        
         return self.gender_list[gender_idx]
 
 
@@ -747,28 +820,32 @@ class VideoProcessor:
         quality_score = 0.0
         rec_score = 0.0
         
-        # Gender
+        # Pre-compute face crop and aligned face for both gender and quality checks
+        face_crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+        align_img = None
+        if landmarks is not None:
+             align_img = self.align_face(frame, landmarks)
+        
+        # Gender check - use aligned face if available for better accuracy
         if target_gender != "All":
-             face_crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
              if face_crop.size > 0:
-                  gender = self.predict_gender(face_crop)
+                  # Pass both face_crop and aligned face for robust gender detection
+                  gender = self.predict_gender(face_crop, aligned_img=align_img)
                   gender_label += f" {gender}"
-                  if gender != target_gender:
+                  if gender == "Unknown":
+                       # Uncertain detection - skip this face when filtering by gender
+                       passed = False
+                  elif gender != target_gender:
                        passed = False
              else:
                   passed = False
-                  
+                   
         if not passed:
              return False, False, {"label": gender_label, "quality": 0.0}
 
         # Rec / Quality
         if min_face_quality > 0 or self.reference_embedding is not None:
-             # Try alignment
-             align_img = None
-             if landmarks is not None:
-                  align_img = self.align_face(frame, landmarks)
-             
-             face_crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+             # align_img already computed above
              use_img = align_img if align_img is not None else face_crop
              
              if use_img is None or use_img.size == 0:
@@ -1034,11 +1111,11 @@ class VideoProcessor:
                     crop_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
                     
                     if crop_img.size > 0:
-                        # Gender (use crop, fast)
+                        # Gender (use both crop and aligned for robust detection)
                         if target_gender != "All":
-                             gender = self.predict_gender(crop_img)
+                             gender = self.predict_gender(crop_img, aligned_img=align_img)
                              gender_label += f" {gender}"
-                             if gender != target_gender:
+                             if gender == "Unknown" or gender != target_gender:
                                  face_valid = False
                         
                         # Rec / Quality (use aligned if available, else crop)
