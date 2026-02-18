@@ -34,7 +34,18 @@ echo [INFO] Cleaning pip cache...
 pip cache purge
 
 echo.
-echo [INFO] Installing dependencies from requirements.txt...
+echo [INFO] Installing PyTorch with CUDA 12.6...
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Failed to install PyTorch with CUDA.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [INFO] Installing remaining dependencies from requirements.txt...
 pip install -r requirements.txt
 
 if errorlevel 1 (

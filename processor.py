@@ -889,7 +889,7 @@ class VideoProcessor:
         
         return passed, low_quality_fail, {"label": gender_label, "quality": quality_score}
 
-    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None, start_time=0.0):
+    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None, start_time=0.0, end_time=0.0):
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -897,6 +897,17 @@ class VideoProcessor:
         # Calculate start frame from start_time
         start_frame = int(start_time * fps) if start_time > 0 else 0
         start_frame = min(start_frame, total_frames - 1)  # Clamp to valid range
+        
+        # Calculate end frame from end_time (0 means process to the end)
+        if end_time > 0:
+            end_frame = int(end_time * fps)
+            end_frame = min(end_frame, total_frames)  # Clamp to valid range
+        else:
+            end_frame = total_frames
+        
+        # Ensure end_frame > start_frame
+        if end_frame <= start_frame:
+            end_frame = total_frames
         
         # Seek to start position if needed
         if start_frame > 0:
@@ -910,13 +921,17 @@ class VideoProcessor:
                 cap.release()
                 return None, "Scanning stopped by user."
 
+            # Stop if we've reached the end frame
+            if frame_idx >= end_frame:
+                break
+
             ret, frame = cap.read()
             if not ret:
                 break
 
             if progress_callback and frame_idx % 10 == 0:
-                # Calculate progress based on frames remaining after start point
-                frames_to_process = total_frames - start_frame
+                # Calculate progress based on frames in the specified range
+                frames_to_process = end_frame - start_frame
                 frames_processed = frame_idx - start_frame
                 progress = frames_processed / frames_to_process if frames_to_process > 0 else 1.0
                 progress_callback(progress)
