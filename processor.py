@@ -736,18 +736,17 @@ class VideoProcessor:
                         if keypoints is not None and i < len(keypoints):
                              lms = keypoints[i] # 5 points (Ref: RightEye, LeftEye, Nose, RightMouth, LeftMouth)
                         
-                        # Pose Filter for YOLO
+                        # Pose Filter for YOLO - Very lenient to allow extreme angles
                         if lms is not None:
                              yaw, pitch, roll = self.estimate_pose_from_landmarks(lms)
-                             # Filter Yaw/Pitch but ALLOW Roll (User wants up to 90 deg tilt)
-                             # Only filter if both yaw AND pitch exceed threshold (conservative)
-                             # or if yaw exceeds threshold significantly (profile view)
-                             if abs(yaw) > max_angle and abs(pitch) > max_angle:
+                             # Only filter extremely unrealistic poses (likely false positives)
+                             # Allow up to ~135 degrees for real profile/extreme views
+                             if abs(yaw) > 135 and abs(pitch) > 135:
                                   continue
-                             # Also filter extreme yaw (profile faces) even if pitch is ok
-                             if abs(yaw) > max_angle + 20:
+                             # Filter only extreme profile views beyond physical possibility
+                             if abs(yaw) > 150:
                                   continue
-                        
+                             
                         detections.append((x1, y1, x2, y2, conf, lms))
         
         elif self.model_type == 'mediapipe':
@@ -781,10 +780,14 @@ class VideoProcessor:
                         
                         lms = np.array([r_eye, l_eye, nose, r_mouth, l_mouth]) # Order: RE, LE, N, RM, LM
                         
-                        # Check Angle with new estimator - allow rotated faces
+                        # Check Angle with new estimator - allow extreme rotated faces
                         yaw, pitch, roll = self.estimate_pose_from_landmarks(lms)
-                        # Only filter extreme profile views, allow rotated faces (up to 90 deg roll)
-                        if abs(yaw) > max_angle + 30 or abs(pitch) > max_angle + 30:
+                        # Only filter extremely unrealistic poses (likely false positives)
+                        # Allow up to ~135 degrees for real profile/extreme views
+                        if abs(yaw) > 135 and abs(pitch) > 135:
+                             continue
+                        # Filter only extreme profile views beyond physical possibility
+                        if abs(yaw) > 150:
                              continue
                         
                         detections.append((x1, y1, x2, y2, conf, lms))
