@@ -726,10 +726,12 @@ class VideoProcessor:
                         if lms is not None:
                              yaw, pitch, roll = self.estimate_pose_from_landmarks(lms)
                              # Filter Yaw/Pitch but ALLOW Roll (User wants up to 90 deg tilt)
-                             if abs(yaw) > max_angle: 
-                                  continue 
-                             # Pitch check (optional, usually less critical, but good to filter extreme looking up/down)
-                             if abs(pitch) > max_angle:
+                             # Only filter if both yaw AND pitch exceed threshold (conservative)
+                             # or if yaw exceeds threshold significantly (profile view)
+                             if abs(yaw) > max_angle and abs(pitch) > max_angle:
+                                  continue
+                             # Also filter extreme yaw (profile faces) even if pitch is ok
+                             if abs(yaw) > max_angle + 20:
                                   continue
                         
                         detections.append((x1, y1, x2, y2, conf, lms))
@@ -765,9 +767,10 @@ class VideoProcessor:
                         
                         lms = np.array([r_eye, l_eye, nose, r_mouth, l_mouth]) # Order: RE, LE, N, RM, LM
                         
-                        # Check Angle with new estimator
+                        # Check Angle with new estimator - allow rotated faces
                         yaw, pitch, roll = self.estimate_pose_from_landmarks(lms)
-                        if abs(yaw) > max_angle or abs(pitch) > max_angle:
+                        # Only filter extreme profile views, allow rotated faces (up to 90 deg roll)
+                        if abs(yaw) > max_angle + 30 or abs(pitch) > max_angle + 30:
                              continue
                         
                         detections.append((x1, y1, x2, y2, conf, lms))
