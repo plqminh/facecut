@@ -30,6 +30,10 @@ class VideoProcessor:
         # FAN (Face Alignment Network) for Strict Validation
         self.fan = None
         
+        # Smoothing for quality scores (Exponential Moving Average)
+        self.quality_ema = None
+        self.quality_ema_alpha = 0.3  # Lower = smoother, Higher = more responsive
+        
         self.ensure_models()
         self.load_models()
         
@@ -129,7 +133,7 @@ class VideoProcessor:
 
 
 
-    def get_embedding(self, face_img, landmarks=None, tilt_boost=1.0):
+    def get_embedding(self, face_img, landmarks=None, tilt_boost=1.0, apply_smoothing=True):
         if self.rec_net is None:
             return None, 0.0
 
@@ -161,6 +165,15 @@ class VideoProcessor:
         # We rely solely on FAN validation (done in evaluate_face) + Raw Feature Norm.
         # No penalties for blur, brightness, or padding.
         composite_score = feature_norm
+        
+        # Apply exponential moving average smoothing to reduce fluctuations
+        if apply_smoothing and composite_score > 0:
+            if self.quality_ema is None:
+                self.quality_ema = composite_score
+            else:
+                self.quality_ema = self.quality_ema_alpha * composite_score + \
+                                   (1 - self.quality_ema_alpha) * self.quality_ema
+            composite_score = self.quality_ema
         
         # Normalize the embedding vector
         norm_embedding = embedding / (feature_norm + 1e-5)
@@ -314,7 +327,8 @@ class VideoProcessor:
                  face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
             
             if face_img.size > 0:
-                self.reference_embedding, _ = self.get_embedding(face_img)
+                # Disable smoothing for reference face to get raw embedding
+                self.reference_embedding, _ = self.get_embedding(face_img, apply_smoothing=False)
                 return True, "Reference face set"
                 
         return False, "Could not process reference face"
@@ -891,6 +905,9 @@ class VideoProcessor:
         return passed, low_quality_fail, {"label": gender_label, "quality": quality_score}
 
     def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None, start_time=0.0, end_time=0.0):
+        # Reset quality EMA at the start of each video scan for fresh smoothing
+        self.quality_ema = None
+        
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1106,6 +1123,9 @@ class VideoProcessor:
         Process a single frame for preview.
         Returns: annotated_frame, is_valid_frame
         """
+        # Reset EMA when starting preview processing (optional, can be removed if continuous smoothing desired)
+        # self.quality_ema = None
+        
         detections = self.detect_faces(frame, min_conf, max_angle)
         
         annotated_frame = frame.copy()
