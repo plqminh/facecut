@@ -107,7 +107,9 @@ class VideoProcessor:
         # Gender
         try:
             self.gender_net = cv2.dnn.readNetFromONNX(self.gender_model)
-            self.gender_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            # Use default backend (auto-detect) for better stability
+            # Avoid DNN_BACKEND_OPENCV which can cause memory host conflicts
+            self.gender_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
             self.gender_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         except Exception as e:
             print(f"Failed to load gender model: {e}")
@@ -116,7 +118,8 @@ class VideoProcessor:
         # Rec
         try:
             self.rec_net = cv2.dnn.readNetFromONNX(self.rec_model)
-            self.rec_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            # Use default backend (auto-detect) for better stability
+            self.rec_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
             self.rec_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         except Exception as e:
             print(f"Failed to load rec model: {e}")
