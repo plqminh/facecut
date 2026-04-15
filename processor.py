@@ -634,25 +634,21 @@ class VideoProcessor:
     def detect_faces(self, frame, min_conf, max_angle=90):
         """
         Multi-rotation wrapper for detection.
+        Optimized to minimize color space conversions.
         """
-        # If max_angle is high (e.g. > 60), assuming user wants to detect highly tilted faces.
-        # We run detection on 0, +90, -90.
-        # Otherwise just 0.
+        # Convert to RGB once for all detection passes
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # Pass 1: Original
-        detections = self._detect_single_pass(frame, min_conf, max_angle)
+        detections = self._detect_single_pass(frame, rgb_frame, min_conf, max_angle)
         
         if max_angle > 60 and len(detections) == 0:
              h, w = frame.shape[:2]
              
              # Pass 2: 90 CW
              frame_90 = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-             # Note: For rotated frame, "upright" face is actually tilted 90 in original.
-             # The filter inside _detect_single_pass filters by Yaw/Pitch.
-             # In rotated frame, Yaw/Pitch are naturally relative to the face's new "upright" orientation.
-             # So a 90-deg tilted face in Original is 0-deg in Rotated.
-             # _detect_single_pass WILL accept it (small yaw/pitch).
-             dets_90 = self._detect_single_pass(frame_90, min_conf, max_angle)
+             rgb_90 = cv2.rotate(rgb_frame, cv2.ROTATE_90_CLOCKWISE)
+             dets_90 = self._detect_single_pass(frame_90, rgb_90, min_conf, max_angle)
              
              for det in dets_90:
                   x1, y1, x2, y2, conf, lms = det
@@ -661,7 +657,8 @@ class VideoProcessor:
                   
              # Pass 3: 90 CCW
              frame_n90 = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-             dets_n90 = self._detect_single_pass(frame_n90, min_conf, max_angle)
+             rgb_n90 = cv2.rotate(rgb_frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+             dets_n90 = self._detect_single_pass(frame_n90, rgb_n90, min_conf, max_angle)
              
              for det in dets_n90:
                   x1, y1, x2, y2, conf, lms = det
@@ -685,7 +682,7 @@ class VideoProcessor:
         
         return detections
 
-    def _detect_single_pass(self, frame, min_conf, max_angle=90):
+    def _detect_single_pass(self, frame, rgb_frame, min_conf, max_angle=90):
         """
         Unified detection method.
         Returns list of (x1, y1, x2, y2, conf, landmarks)
@@ -694,7 +691,6 @@ class VideoProcessor:
         detections = []
         
         if self.model_type == 's3fd':
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             preds = self.detector.detect_from_image(rgb_frame)
             if preds is not None:
                 for pred in preds:
@@ -736,7 +732,6 @@ class VideoProcessor:
                         detections.append((x1, y1, x2, y2, conf, lms))
         
         elif self.model_type == 'mediapipe':
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.mp_face_detection.process(rgb_frame)
             if results.detections:
                 h, w, _ = frame.shape
@@ -778,7 +773,7 @@ class VideoProcessor:
 
 
 
-    def evaluate_face(self, frame, detection, target_gender, rec_threshold, min_face_quality, force_tilt_boost=False):
+    def evaluate_face(self, frame, detection, target_gender, rec_threshold, min_face_quality, force_tilt_boost=False, rgb_frame=None):
         """
         Evaluate a single face against criteria.
         Returns: (passed_filters, low_quality_fail_only, details_dict)
@@ -796,11 +791,11 @@ class VideoProcessor:
              # FaceAlignment.get_landmarks(image, detected_faces=[(x1, y1, x2, y2)])
              
              try:
-                  # Convert to RGB only once if needed? 
-                  # Actually detected_faces arg in get_landmarks makes it efficient.
-                  rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                  # Use pre-converted RGB frame if available for performance
+                  if rgb_frame is None:
+                      rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                   
-                  preds = self.fan.get_landmarks(rgb, detected_faces=[(x1, y1, x2, y2)])
+                  preds = self.fan.get_landmarks(rgb_frame, detected_faces=[(x1, y1, x2, y2)])
                   
                   if preds is None or len(preds) == 0:
                        # FAN Failed -> Bad Face Structure
@@ -936,7 +931,8 @@ class VideoProcessor:
                 progress = frames_processed / frames_to_process if frames_to_process > 0 else 1.0
                 progress_callback(progress)
 
-            # Run inference
+            # Run inference - convert to RGB once and reuse for detection and evaluation
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             detections = self.detect_faces(frame, min_conf, max_angle)
             
             is_valid = False
@@ -952,7 +948,7 @@ class VideoProcessor:
             evaluated_detections = [] # Store (det, details, passed) for preview
             
             for det in detections:
-                 passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality)
+                 passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality, rgb_frame=rgb_frame)
                  if passed:
                       is_valid = True
                  if low_qual_fail:
@@ -968,7 +964,8 @@ class VideoProcessor:
                  
                  for rot in rotations:
                       frame_rot = cv2.rotate(frame, rot)
-                      dets_rot = self._detect_single_pass(frame_rot, min_conf, max_angle)
+                      rgb_rot = cv2.rotate(rgb_frame, rot)
+                      dets_rot = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
                       
                       for d_rot in dets_rot:
                            # Map back
@@ -977,7 +974,7 @@ class VideoProcessor:
                            det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
                            
                            # Evaluate on the ROTATED frame (where face is upright)
-                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
+                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True, rgb_frame=rgb_rot)
                            
                            if passed:
                                 is_valid = True
@@ -1173,6 +1170,8 @@ class VideoProcessor:
         Process a single frame for preview (Smart Rotation enabled).
         Returns: annotated_frame, is_valid_frame
         """
+        # Convert to RGB once for all operations
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         detections = self.detect_faces(frame, min_conf, max_angle)
         
         annotated_frame = frame.copy()
@@ -1185,7 +1184,7 @@ class VideoProcessor:
 
         # Phase 1: Standard Evaluation
         for det in detections:
-             passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality)
+             passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality, rgb_frame=rgb_frame)
              if passed:
                   is_valid = True
              if low_qual_fail:
@@ -1201,7 +1200,8 @@ class VideoProcessor:
              
              for rot in rotations:
                   frame_rot = cv2.rotate(frame, rot)
-                  dets_rot = self._detect_single_pass(frame_rot, min_conf, max_angle)
+                  rgb_rot = cv2.rotate(rgb_frame, rot)
+                  dets_rot = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
                   
                   for d_rot in dets_rot:
                        # Map back
@@ -1210,7 +1210,7 @@ class VideoProcessor:
                        det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
                        
                        # Evaluate on ROTATED FRAME for best quality
-                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True)
+                       passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True, rgb_frame=rgb_rot)
                        
                        if passed:
                             is_valid = True
