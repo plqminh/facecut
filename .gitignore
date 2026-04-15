@@ -1,2 +1,1 @@
-__pycache__/
-venv/
+Nothing should be ignored based on the provided file changes, as only a Python source file (`processor.py`) was modified and no build artifacts, dependencies, or temporary files were included in the changes.
