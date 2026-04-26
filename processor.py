@@ -18,8 +18,8 @@ class VideoProcessor:
         self.detector = None
         self.mp_face_detection = None
         self.gender_net = None
-        # InsightFace GenderAge Model: 0=Female, 1=Male
-        self.gender_list = ['Female', 'Male'] 
+        # InsightFace GenderAge Model: 0=Male, 1=Female
+        self.gender_list = ['Male', 'Female'] 
         self.gender_model = "genderage.onnx"
         
         # Face Recognition
