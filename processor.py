@@ -19,9 +19,9 @@ class VideoProcessor:
         self.mp_face_detection = None
         self.gender_net = None
         # InsightFace GenderAge Model (buffalo_l): 
-        # Output is [male_logit, female_logit, age]
-        # Index 0 = Male, Index 1 = Female (per InsightFace source code)
-        self.gender_list = ['Male', 'Female'] 
+        # Output is [female_logit, male_logit, age]
+        # Index 0 = Female, Index 1 = Male (per InsightFace official implementation)
+        self.gender_list = ['Female', 'Male'] 
         self.gender_model = "genderage.onnx"
         
         # Face Recognition
@@ -341,8 +341,8 @@ class VideoProcessor:
         Uses horizontal flip + multi-scale + optional aligned face for voting.
         Returns: (gender_string, confidence) or just gender_string for backward compat.
         
-        InsightFace GenderAge model output: [male_logit, female_logit, age]
-        Index 0 = Male, Index 1 = Female
+        InsightFace GenderAge model output: [female_logit, male_logit, age]
+        Index 0 = Female, Index 1 = Male
         """
         if self.gender_net is None:
             return "Unknown"
@@ -365,7 +365,7 @@ class VideoProcessor:
                                            swapRB=True, crop=False)
                 self.gender_net.setInput(blob)
                 preds = self.gender_net.forward()
-                # Output shape is (1, 3). [0]=male_logit, [1]=female_logit, [2]=age
+                # Output shape is (1, 3). [0]=female_logit, [1]=male_logit, [2]=age
                 return preds[0][:2]
             except Exception:
                 return None
