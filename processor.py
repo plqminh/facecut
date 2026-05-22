@@ -5,10 +5,13 @@ from ultralytics import YOLO
 import mediapipe as mp
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 import torch
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 import os
 import urllib.request
 import zipfile
 import shutil
+import onnxruntime as ort
 
 class VideoProcessor:
     def __init__(self, model_type='yolo'):
@@ -18,11 +21,11 @@ class VideoProcessor:
         self.detector = None
         self.mp_face_detection = None
         self.gender_net = None
-        # InsightFace GenderAge Model (buffalo_l): 
-        # Output is [male_logit, female_logit, age]
-        # Index 0 = Male, Index 1 = Female (per InsightFace source code)
+        # FairFace Model (ResNet34, trained on racially-balanced dataset)
+        # Multi-head output: race(7), gender(2), age(9)
+        # Gender: Index 0 = Male, Index 1 = Female
         self.gender_list = ['Male', 'Female'] 
-        self.gender_model = "genderage.onnx"
+        self.gender_model = "fairface.onnx"
         
         # Face Recognition
         self.rec_net = None
@@ -45,7 +48,8 @@ class VideoProcessor:
             # Initialize FaceAlignment with S3FD detector
             self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, 
                                                  face_detector='sfd', 
-                                                 device=self.device)
+                                                 device=self.device,
+                                                 compile=False)
             self.detector = self.fa.face_detector
         elif self.model_type == 'yolo':
             self.model = YOLO('yolo11n-face.pt')
@@ -64,19 +68,21 @@ class VideoProcessor:
                 # Use CPU/Cuda based on avail. '2D' landmarks.
                 self.fan = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, 
                                                       device=self.device, 
-                                                      face_detector='blazeface') # Use lightweight internal detector?
+                                                      face_detector='blazeface',
+                                                      compile=False) # Use lightweight internal detector?
                                                       # Actually we pass the rect, so detector matters less, but blazeface is standard.
                 print("FAN loaded.")
             except Exception as e:
                 print(f"Failed to load FAN: {e}")
                 
     def ensure_models(self):
-        # Gender
+        # Gender (FairFace - racially balanced)
         if not os.path.exists(self.gender_model):
-            print("Downloading gender model (ONNX)...")
-            url = "https://huggingface.co/lithiumice/insightface/resolve/main/models/buffalo_l/genderage.onnx"
+            print("Downloading FairFace gender model (ONNX)...")
+            url = "https://github.com/yakhyo/fairface-onnx/releases/download/weights/fairface.onnx"
             try:
                 urllib.request.urlretrieve(url, self.gender_model)
+                print(f"Downloaded {self.gender_model}")
             except Exception as e:
                 print(f"Failed to download gender model: {e}")
 
@@ -110,13 +116,14 @@ class VideoProcessor:
                 print(f"Failed to download/extract rec model: {e}")
 
     def load_models(self):
-        # Gender
+        # Gender (FairFace via onnxruntime - multi-head output)
         try:
-            self.gender_net = cv2.dnn.readNetFromONNX(self.gender_model)
-            # Use default backend (auto-detect) for better stability
-            # Avoid DNN_BACKEND_OPENCV which can cause memory host conflicts
-            self.gender_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
-            self.gender_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            self.gender_net = ort.InferenceSession(
+                self.gender_model, providers=['CPUExecutionProvider'])
+            input_meta = self.gender_net.get_inputs()[0]
+            self.gender_input_name = input_meta.name
+            self.gender_output_names = [o.name for o in self.gender_net.get_outputs()]
+            print(f"Loaded FairFace gender model ({len(self.gender_output_names)} heads)")
         except Exception as e:
             print(f"Failed to load gender model: {e}")
             self.gender_net = None
@@ -335,99 +342,93 @@ class VideoProcessor:
                 
         return False, "Could not process reference face"
 
-    def predict_gender(self, face_img, aligned_img=None):
+    def predict_gender(self, frame, bbox, aligned_img=None):
         """
-        Robust gender prediction using test-time augmentation.
-        Uses horizontal flip + multi-scale + optional aligned face for voting.
-        Returns: (gender_string, confidence) or just gender_string for backward compat.
+        Gender prediction using FairFace (ResNet34, racially-balanced training).
         
-        InsightFace GenderAge model output: [male_logit, female_logit, age]
-        Index 0 = Male, Index 1 = Female
+        FairFace was specifically designed for fair face attribute prediction
+        across 7 race groups including East Asian and Southeast Asian.
+        
+        Args:
+            frame: Full BGR frame
+            bbox: (x1, y1, x2, y2) face bounding box
+            aligned_img: Unused, kept for API compat
+        
+        FairFace output: 3 heads [race_logits(7), gender_logits(2), age_logits(9)]
+        Gender: Index 0 = Male, Index 1 = Female
         """
         if self.gender_net is None:
             return "Unknown"
         
-        if face_img is None or face_img.size == 0:
+        if frame is None or frame.size == 0:
             return "Unknown"
-            
-        # Collect all predictions (logits) for averaging
-        all_logits = []
         
-        def run_inference(img):
-            """Run single inference and return gender logits."""
-            if img is None or img.size == 0:
+        x1, y1, x2, y2 = bbox
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 0 or bh <= 0:
+            return "Unknown"
+        
+        def preprocess_fairface(img, face_bbox=None):
+            """FairFace preprocessing: 25% padded crop, 224x224, ImageNet normalization."""
+            if face_bbox is not None:
+                bx1, by1, bx2, by2 = face_bbox
+                w, h = bx2 - bx1, by2 - by1
+                padding = 0.25
+                x_pad = int(w * padding)
+                y_pad = int(h * padding)
+                bx1 = max(0, bx1 - x_pad)
+                by1 = max(0, by1 - y_pad)
+                bx2 = min(img.shape[1], bx2 + x_pad)
+                by2 = min(img.shape[0], by2 + y_pad)
+                img = img[by1:by2, bx1:bx2]
+            
+            if img.size == 0:
                 return None
-            try:
-                # InsightFace GenderAge Preprocessing
-                # Resize to 96x96, Mean 127.5, Scale 1/128.0, RGB
-                blob = cv2.dnn.blobFromImage(img, 1.0/128.0, (96, 96), 
-                                           (127.5, 127.5, 127.5), 
-                                           swapRB=True, crop=False)
-                self.gender_net.setInput(blob)
-                preds = self.gender_net.forward()
-                # Output shape is (1, 3). [0]=male_logit, [1]=female_logit, [2]=age
-                return preds[0][:2]
-            except Exception:
-                return None
-        
-        # 1. Original face crop
-        logits = run_inference(face_img)
-        if logits is not None:
-            all_logits.append(logits)
-        
-        # 2. Horizontal flip (mirrors potential pose asymmetry)
-        flipped = cv2.flip(face_img, 1)
-        logits = run_inference(flipped)
-        if logits is not None:
-            all_logits.append(logits)
-        
-        # 3. Slight scale variations (0.9x and 1.1x center crop effect)
-        h, w = face_img.shape[:2]
-        if h > 20 and w > 20:
-            # 0.9x - center crop
-            margin_h, margin_w = int(h * 0.05), int(w * 0.05)
-            cropped = face_img[margin_h:h-margin_h, margin_w:w-margin_w]
-            logits = run_inference(cropped)
-            if logits is not None:
-                all_logits.append(logits)
             
-            # Flipped center crop
-            cropped_flip = cv2.flip(cropped, 1)
-            logits = run_inference(cropped_flip)
-            if logits is not None:
-                all_logits.append(logits)
+            # Resize to 224x224
+            img = cv2.resize(img, (224, 224))
+            # BGR -> RGB
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # ImageNet normalization
+            img = img.astype(np.float32) / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            img = (img - mean) / std
+            # HWC -> CHW, add batch dim
+            img = np.transpose(img, (2, 0, 1))
+            img = np.expand_dims(img, axis=0)
+            return img
         
-        # 4. If aligned face is provided, use it (best quality input)
-        if aligned_img is not None and aligned_img.size > 0:
-            logits = run_inference(aligned_img)
-            if logits is not None:
-                all_logits.append(logits * 1.5)  # Weight aligned face higher
+        try:
+            # Preprocess with padded bbox crop
+            blob = preprocess_fairface(frame, (x1, y1, x2, y2))
+            if blob is None:
+                return "Unknown"
             
-            # Flipped aligned
-            aligned_flip = cv2.flip(aligned_img, 1)
-            logits = run_inference(aligned_flip)
-            if logits is not None:
-                all_logits.append(logits * 1.5)
-        
-        if len(all_logits) == 0:
+            # Run inference (3 heads: race, gender, age)
+            outputs = self.gender_net.run(
+                self.gender_output_names, {self.gender_input_name: blob})
+            
+            # Gender is the second head (index 1)
+            gender_logits = outputs[1][0]
+            
+            # Softmax
+            exp_logits = np.exp(gender_logits - np.max(gender_logits))
+            probs = exp_logits / np.sum(exp_logits)
+            
+            gender_idx = int(np.argmax(probs))
+            confidence = probs[gender_idx]
+            
+            # If confidence is too low, return Unknown
+            if confidence < 0.55:
+                return "Unknown"
+            
+            return self.gender_list[gender_idx]
+            
+        except Exception as e:
+            print(f"Gender prediction error: {e}")
             return "Unknown"
-        
-        # Average all logits
-        avg_logits = np.mean(all_logits, axis=0)
-        
-        # Softmax for confidence
-        exp_logits = np.exp(avg_logits - np.max(avg_logits))
-        probs = exp_logits / np.sum(exp_logits)
-        
-        gender_idx = np.argmax(avg_logits)
-        confidence = probs[gender_idx]
-        
-        # If confidence is too low, return Unknown
-        # Threshold ~0.6 means model is fairly uncertain
-        if confidence < 0.55:
-            return "Unknown"
-        
-        return self.gender_list[gender_idx]
 
 
 
@@ -849,11 +850,10 @@ class VideoProcessor:
         if landmarks is not None:
              align_img = self.align_face(frame, landmarks)
         
-        # Gender check - use aligned face if available for better accuracy
+        # Gender check - use padded bbox crop matching InsightFace preprocessing
         if target_gender != "All":
              if face_crop.size > 0:
-                  # Pass both face_crop and aligned face for robust gender detection
-                  gender = self.predict_gender(face_crop, aligned_img=align_img)
+                  gender = self.predict_gender(frame, (x1, y1, x2, y2))
                   gender_label += f" {gender}"
                   if gender == "Unknown":
                        # Uncertain detection - skip this face when filtering by gender
@@ -1157,9 +1157,9 @@ class VideoProcessor:
                     crop_img = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
                     
                     if crop_img.size > 0:
-                        # Gender (use both crop and aligned for robust detection)
+                        # Gender (use padded bbox crop matching InsightFace preprocessing)
                         if target_gender != "All":
-                             gender = self.predict_gender(crop_img, aligned_img=align_img)
+                             gender = self.predict_gender(frame, (x1, y1, x2, y2))
                              gender_label += f" {gender}"
                              if gender == "Unknown" or gender != target_gender:
                                  face_valid = False

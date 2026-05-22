@@ -229,6 +229,10 @@ class FaceCutApp(ctk.CTk):
             # Default to S3FD if variable not set yet (though it is set in init)
             model = self.model_var.get() if hasattr(self, 'model_var') else 'yolo'
             self.processor = VideoProcessor(model_type=model)
+            # Pre-load FAN on this background thread so it doesn't freeze
+            # the UI when first used in preview
+            self.lbl_status.configure(text="Loading FAN alignment...")
+            self.processor.ensure_fan()
             self.lbl_status.configure(text=f"AI Ready ({model.upper()})")
         except Exception as e:
             self.lbl_status.configure(text="AI Init Error")
@@ -397,7 +401,6 @@ class FaceCutApp(ctk.CTk):
             
             if frame is not None and self.processor is not None:
                 min_conf = self.slider_conf.get()
-                # Use obstruction slider
                 max_angle = self.slider_angle.get()
                 target_gender = self.combo_gender.get()
                 rec_thresh = self.slider_sim.get()
