@@ -157,10 +157,10 @@ class VideoProcessor:
         
         # If image is big, resize. If 112x112 (aligned), keep.
         if face_img.shape[0] != 112 or face_img.shape[1] != 112:
-             # Standard Resize if not already aligned
-             blob_input = cv2.resize(face_img, (112, 112))
+            # Standard Resize if not already aligned
+            blob_input = cv2.resize(face_img, (112, 112))
         else:
-             blob_input = face_img
+            blob_input = face_img
              
         blob = cv2.dnn.blobFromImage(blob_input, 1.0/127.5, (112, 112), 
                                    (127.5, 127.5, 127.5), 
@@ -259,12 +259,12 @@ class VideoProcessor:
             dst = np.array([img_le, img_re, nose, img_lm, img_rm], dtype=np.float32)
 
         elif len(landmarks) == 5:
-             # Assumed order: [ImageLeftEye, ImageRightEye, Nose, ImageLeftMouth, ImageRightMouth]
-             # Note: My Mediapipe wrapper had: [r_eye(0), l_eye(1)...]
-             # MP 0 is Right Eye (Patient Right -> Image Left). Correct.
-             dst = np.array(landmarks, dtype=np.float32)
+            # Assumed order: [ImageLeftEye, ImageRightEye, Nose, ImageLeftMouth, ImageRightMouth]
+            # Note: My Mediapipe wrapper had: [r_eye(0), l_eye(1)...]
+            # MP 0 is Right Eye (Patient Right -> Image Left). Correct.
+            dst = np.array(landmarks, dtype=np.float32)
         else:
-             return None
+            return None
             
         # Standard ArcFace 112x112 reference points
         src = np.array([
@@ -278,13 +278,13 @@ class VideoProcessor:
         
         # Estimate affine transform
         try:
-             tform = cv2.estimateAffinePartial2D(dst, src, method=cv2.LMEDS)[0]
-             if tform is None:
-                  # Fallback to simple affine if LMEDS fails
-                  tform = cv2.estimateAffinePartial2D(dst, src)[0]
+            tform = cv2.estimateAffinePartial2D(dst, src, method=cv2.LMEDS)[0]
+            if tform is None:
+                # Fallback to simple affine if LMEDS fails
+                tform = cv2.estimateAffinePartial2D(dst, src)[0]
         except Exception as e:
-             print(f"Align Error: {e}")
-             return None
+            print(f"Align Error: {e}")
+            return None
              
         if tform is None:
             return None
@@ -329,11 +329,11 @@ class VideoProcessor:
             x1, y1, x2, y2, _, landmarks = best_face
             # If landmarks exist, align from FULL image
             if landmarks is not None:
-                 face_img = self.align_face(img, landmarks)
-                 if face_img is None:
-                      face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                face_img = self.align_face(img, landmarks)
+                if face_img is None:
+                    face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
             else:
-                 face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+                face_img = img[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
             
             if face_img.size > 0:
                 # Disable smoothing for reference face to get raw embedding
