@@ -1,5 +1,6 @@
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
+import tkinter as tk
 import threading
 import os
 import cv2
@@ -26,16 +27,22 @@ class FaceCutApp(ctk.CTk):
         
         self.minsize(800, 500)
 
-        # Grid configuration: 0=Sidebar (Fixed/Scroll), 1=ClipList (Flex), 2=Preview (More Flex)
-        self.grid_columnconfigure(0, weight=0, minsize=260) # Sidebar slightly wider for scrollbar
-        self.grid_columnconfigure(1, weight=1, minsize=300) # Clip List expands
-        self.grid_columnconfigure(2, weight=3) # Preview expands more
+        # Grid configuration: Single cell for PanedWindow
         self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        appearance = ctk.get_appearance_mode()
+        pane_bg = "#2b2b2b" if appearance == "Dark" else "#ebebeb"
+
+        self.paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashwidth=6, sashrelief=tk.RAISED, bg=pane_bg, opaqueresize=True)
+        self.paned.grid(row=0, column=0, sticky="nsew")
 
         # --- Left Sidebar (Controls) ---
-        # Use ScrollableFrame to handle small screens/scaling
-        self.sidebar = ctk.CTkScrollableFrame(self, width=250, corner_radius=0, label_text="")
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        # Container needed for scrollable frame inside paned window
+        self.sidebar_container = ctk.CTkFrame(self.paned, width=250, corner_radius=0)
+        self.sidebar = ctk.CTkScrollableFrame(self.sidebar_container, corner_radius=0, label_text="")
+        self.sidebar.pack(fill="both", expand=True)
+        self.paned.add(self.sidebar_container, minsize=260)
         # Removing spacer weight to allow natural stacking in scroll view
         # self.sidebar.grid_rowconfigure(20, weight=1)
 
@@ -77,21 +84,34 @@ class FaceCutApp(ctk.CTk):
         
         self.slider_quality = ctk.CTkSlider(self.sidebar, from_=0, to=40, number_of_steps=40, command=self.update_quality_label)
         self.slider_quality.set(0) # Default off or 15
-        self.slider_quality.grid(row=14, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_quality.grid(row=14, column=0, padx=20, pady=(0, 5), sticky="ew")
+
+        # Keep No-Face Frames Checkbox
+        self.keep_noface_var = ctk.BooleanVar(value=True)
+        self.chk_keep_noface = ctk.CTkCheckBox(self.sidebar, text="Keep No-Face Frames", variable=self.keep_noface_var)
+        self.chk_keep_noface.grid(row=15, column=0, padx=20, pady=(5, 0), sticky="w")
+
+        # Min No-Face Duration Slider
+        self.lbl_noface_dur = ctk.CTkLabel(self.sidebar, text="Min No-Face Duration: 0.0s")
+        self.lbl_noface_dur.grid(row=16, column=0, padx=20, pady=(5, 0), sticky="w")
+        
+        self.slider_noface_dur = ctk.CTkSlider(self.sidebar, from_=0.0, to=5.0, number_of_steps=50, command=self.update_noface_dur_label)
+        self.slider_noface_dur.set(0.0)
+        self.slider_noface_dur.grid(row=17, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Min Duration Slider
         self.lbl_duration = ctk.CTkLabel(self.sidebar, text="Min Duration: 0.5s")
-        self.lbl_duration.grid(row=15, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_duration.grid(row=18, column=0, padx=20, pady=(10, 0), sticky="w")
         self.slider_duration = ctk.CTkSlider(self.sidebar, from_=0.0, to=2.0, number_of_steps=20, command=self.update_duration_label)
         self.slider_duration.set(0.5)
-        self.slider_duration.grid(row=16, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_duration.grid(row=19, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Start Time Entry
         self.lbl_start_time = ctk.CTkLabel(self.sidebar, text="Start Time (seconds)")
-        self.lbl_start_time.grid(row=17, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_start_time.grid(row=20, column=0, padx=20, pady=(10, 0), sticky="w")
         
         self.start_time_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.start_time_frame.grid(row=18, column=0, padx=20, pady=(0, 5), sticky="ew")
+        self.start_time_frame.grid(row=21, column=0, padx=20, pady=(0, 5), sticky="ew")
         
         self.entry_start_time = ctk.CTkEntry(self.start_time_frame, width=80, placeholder_text="0")
         self.entry_start_time.pack(side="left")
@@ -103,10 +123,10 @@ class FaceCutApp(ctk.CTk):
 
         # End Time Entry
         self.lbl_end_time = ctk.CTkLabel(self.sidebar, text="End Time (0 = full video)")
-        self.lbl_end_time.grid(row=19, column=0, padx=20, pady=(5, 0), sticky="w")
+        self.lbl_end_time.grid(row=22, column=0, padx=20, pady=(5, 0), sticky="w")
         
         self.end_time_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.end_time_frame.grid(row=20, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.end_time_frame.grid(row=23, column=0, padx=20, pady=(0, 10), sticky="ew")
         
         self.entry_end_time = ctk.CTkEntry(self.end_time_frame, width=80, placeholder_text="0")
         self.entry_end_time.pack(side="left")
@@ -120,63 +140,74 @@ class FaceCutApp(ctk.CTk):
 
         # Max Angle Slider
         self.lbl_angle = ctk.CTkLabel(self.sidebar, text="Max Angle: 45°")
-        self.lbl_angle.grid(row=21, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_angle.grid(row=24, column=0, padx=20, pady=(10, 0), sticky="w")
         self.slider_angle = ctk.CTkSlider(self.sidebar, from_=10, to=90, number_of_steps=80, command=self.update_angle_label)
         self.slider_angle.set(45)
-        self.slider_angle.grid(row=22, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_angle.grid(row=25, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Gender Selection
         self.lbl_gender = ctk.CTkLabel(self.sidebar, text="Keep Gender")
-        self.lbl_gender.grid(row=23, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_gender.grid(row=26, column=0, padx=20, pady=(10, 0), sticky="w")
         self.combo_gender = ctk.CTkComboBox(self.sidebar, values=["All", "Male", "Female"])
         self.combo_gender.set("All")
-        self.combo_gender.grid(row=24, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.combo_gender.grid(row=27, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         # Face Recognition
         self.lbl_rec = ctk.CTkLabel(self.sidebar, text="Face Recognition")
-        self.lbl_rec.grid(row=25, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.lbl_rec.grid(row=28, column=0, padx=20, pady=(10, 0), sticky="w")
         
         self.btn_ref_face = ctk.CTkButton(self.sidebar, text="Set Ref Face", command=self.set_reference_face)
-        self.btn_ref_face.grid(row=26, column=0, padx=20, pady=(5, 5), sticky="ew")
+        self.btn_ref_face.grid(row=29, column=0, padx=20, pady=(5, 5), sticky="ew")
         
         self.lbl_ref_status = ctk.CTkLabel(self.sidebar, text="No Ref Face", font=ctk.CTkFont(size=10))
-        self.lbl_ref_status.grid(row=27, column=0, padx=20, pady=(0, 5))
+        self.lbl_ref_status.grid(row=30, column=0, padx=20, pady=(0, 5))
         
         self.lbl_sim = ctk.CTkLabel(self.sidebar, text="Sim Threshold: 0.50")
-        self.lbl_sim.grid(row=28, column=0, padx=20, pady=(5, 0), sticky="w")
+        self.lbl_sim.grid(row=31, column=0, padx=20, pady=(5, 0), sticky="w")
         
         self.slider_sim = ctk.CTkSlider(self.sidebar, from_=0.1, to=1.0, number_of_steps=90, command=self.update_sim_label)
         self.slider_sim.set(0.5)
-        self.slider_sim.grid(row=29, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.slider_sim.grid(row=32, column=0, padx=20, pady=(0, 10), sticky="ew")
 
         self.btn_process = ctk.CTkButton(self.sidebar, text="Start Processing", command=self.start_processing, state="disabled", fg_color="green")
-        self.btn_process.grid(row=30, column=0, padx=20, pady=(20, 10))
+        self.btn_process.grid(row=33, column=0, padx=20, pady=(20, 10))
 
         self.btn_stop = ctk.CTkButton(self.sidebar, text="Stop", command=self.stop_processing, state="disabled", fg_color="red")
-        self.btn_stop.grid(row=31, column=0, padx=20, pady=(0, 10))
+        self.btn_stop.grid(row=34, column=0, padx=20, pady=(0, 10))
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar)
-        self.progress_bar.grid(row=32, column=0, padx=20, pady=10, sticky="ew")
+        self.progress_bar.grid(row=35, column=0, padx=20, pady=10, sticky="ew")
         self.progress_bar.set(0)
 
         self.lbl_status = ctk.CTkLabel(self.sidebar, text="Ready")
-        self.lbl_status.grid(row=33, column=0, padx=20, pady=10)
+        self.lbl_status.grid(row=36, column=0, padx=20, pady=10)
 
 
         # --- Middle Column (Clip List) ---
-        self.clip_frame = ctk.CTkFrame(self, width=300, corner_radius=0)
-        self.clip_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=0)
-        self.clip_frame.grid_rowconfigure(1, weight=1)
+        self.clip_frame = ctk.CTkFrame(self.paned, width=300, corner_radius=0)
+        self.paned.add(self.clip_frame, minsize=300)
+        self.clip_frame.grid_rowconfigure(2, weight=1)
         self.clip_frame.grid_columnconfigure(0, weight=1)
 
         self.lbl_clips_title = ctk.CTkLabel(self.clip_frame, text="Clips Found: 0", font=ctk.CTkFont(size=16, weight="bold"))
         self.lbl_clips_title.grid(row=0, column=0, padx=10, pady=10)
 
+        # Min Clip Duration Filter Slider
+        self.clip_filter_frame = ctk.CTkFrame(self.clip_frame, fg_color="transparent")
+        self.clip_filter_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+        
+        self.lbl_clip_min_dur = ctk.CTkLabel(self.clip_filter_frame, text="Min Clip Duration: 0.0s")
+        self.lbl_clip_min_dur.pack(anchor="w", padx=5)
+        
+        self.slider_clip_min_dur = ctk.CTkSlider(self.clip_filter_frame, from_=0.0, to=10.0, number_of_steps=100, command=self.update_clip_min_dur)
+        self.slider_clip_min_dur.set(0.0)
+        self.slider_clip_min_dur.pack(fill="x", padx=5, pady=(0, 5))
+
         self.scroll_clips = ctk.CTkScrollableFrame(self.clip_frame)
-        self.scroll_clips.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        self.scroll_clips.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
         
         self.clip_actions_frame = ctk.CTkFrame(self.clip_frame)
-        self.clip_actions_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=10)
+        self.clip_actions_frame.grid(row=3, column=0, sticky="ew", padx=5, pady=10)
         
         self.btn_toggle_all = ctk.CTkButton(self.clip_actions_frame, text="Toggle All", command=self.toggle_all_clips, width=100)
         self.btn_toggle_all.pack(side="left", padx=5)
@@ -186,8 +217,8 @@ class FaceCutApp(ctk.CTk):
 
 
         # --- Right Main Area (Preview) ---
-        self.preview_frame = ctk.CTkFrame(self)
-        self.preview_frame.grid(row=0, column=2, padx=(0, 20), pady=20, sticky="nsew")
+        self.preview_frame = ctk.CTkFrame(self.paned, corner_radius=0)
+        self.paned.add(self.preview_frame, minsize=400)
         self.preview_frame.grid_rowconfigure(0, weight=1)
         self.preview_frame.grid_columnconfigure(0, weight=1)
 
@@ -264,6 +295,9 @@ class FaceCutApp(ctk.CTk):
     
     def update_duration_label(self, value):
         self.lbl_duration.configure(text=f"Min Duration: {value:.1f}s")
+
+    def update_noface_dur_label(self, value):
+        self.lbl_noface_dur.configure(text=f"Min No-Face Duration: {value:.1f}s")
 
     def set_start_time_from_playhead(self):
         """Set the start time entry to the current playhead position."""
@@ -441,6 +475,8 @@ class FaceCutApp(ctk.CTk):
         target_gender = self.combo_gender.get()
         rec_thresh = self.slider_sim.get()
         min_quality = self.slider_quality.get()
+        keep_noface = self.keep_noface_var.get()
+        min_noface_dur = self.slider_noface_dur.get()
         start_time = self.get_start_time()
         end_time = self.get_end_time()
         self.stop_event.clear()
@@ -448,7 +484,7 @@ class FaceCutApp(ctk.CTk):
         # Clear existing clips
         self.clear_clip_list()
 
-        threading.Thread(target=self.run_processing, args=(min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality, start_time, end_time)).start()
+        threading.Thread(target=self.run_processing, args=(min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality, start_time, end_time, keep_noface, min_noface_dur)).start()
 
     def stop_processing(self):
         self.stop_event.set()
@@ -464,13 +500,46 @@ class FaceCutApp(ctk.CTk):
 
     def populate_clip_list(self, segments):
         self.detected_segments = segments
-        self.lbl_clips_title.configure(text=f"Clips Found: {len(segments)}")
+        self._rebuild_clip_list()
+
+    def _rebuild_clip_list(self):
+        """Rebuild the clip list UI, filtering by min clip duration slider."""
+        # Clear existing UI
+        for widget in self.scroll_clips.winfo_children():
+            widget.destroy()
+        self.clip_check_vars = []
         
-        for i, seg in enumerate(segments):
+        min_clip_dur = self.slider_clip_min_dur.get()
+        shown_count = 0
+        
+        for i, seg in enumerate(self.detected_segments):
             start = seg['start_frame']
             end = seg['end_frame']
             duration = (end - start + 1) / self.fps
             start_time = start / self.fps
+            
+            # Filter by min clip duration
+            if duration < min_clip_dur:
+                # Still track with a False var so indices stay aligned
+                chk_var = ctk.BooleanVar(value=False)
+                self.clip_check_vars.append(chk_var)
+                continue
+            
+            shown_count += 1
+            
+            # Build gender tag string
+            gender_tags = ""
+            if seg.get('has_male'):
+                gender_tags += " [Male]"
+            genders = seg.get('genders', [])
+            if 'Female' in genders:
+                gender_tags += " [Female]"
+            
+            # Tag no-face segments
+            has_face = seg.get('has_face', True)
+            face_tag = ""
+            if not has_face:
+                face_tag = " [No Face]"
             
             chk_var = ctk.BooleanVar(value=True)
             self.clip_check_vars.append(chk_var)
@@ -479,13 +548,23 @@ class FaceCutApp(ctk.CTk):
             row = ctk.CTkFrame(self.scroll_clips, fg_color="transparent")
             row.pack(fill="x", pady=2)
             
-            chk = ctk.CTkCheckBox(row, text=f"Clip {i+1}: {duration:.1f}s (at {start_time:.1f}s)", variable=chk_var)
+            clip_label = f"Clip {i+1}: {duration:.1f}s (at {start_time:.1f}s){gender_tags}{face_tag}"
+            text_color = "#888888" if not has_face else None  # Dim no-face clips
+            chk = ctk.CTkCheckBox(row, text=clip_label, variable=chk_var,
+                                   text_color=text_color if text_color else ctk.ThemeManager.theme["CTkCheckBox"]["text_color"])
             chk.pack(side="left")
             
             # Preview button
             btn_prev = ctk.CTkButton(row, text="▶", width=30, height=20, 
                                      command=lambda s=start, e=end: self.preview_segment(s, e))
             btn_prev.pack(side="right", padx=5)
+        
+        self.lbl_clips_title.configure(text=f"Clips Found: {shown_count}/{len(self.detected_segments)}")
+
+    def update_clip_min_dur(self, value):
+        self.lbl_clip_min_dur.configure(text=f"Min Clip Duration: {value:.1f}s")
+        if self.detected_segments:
+            self._rebuild_clip_list()
 
     def toggle_all_clips(self):
         # Check if all are true
@@ -508,7 +587,7 @@ class FaceCutApp(ctk.CTk):
         self.start_rendering(selected_segments)
 
 
-    def run_processing(self, min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality, start_time=0.0, end_time=0.0):
+    def run_processing(self, min_conf, min_dur, max_angle, target_gender, rec_thresh, min_quality, start_time=0.0, end_time=0.0, keep_noface=True, min_noface_dur=0.0):
         try:
             # Phase 1: Scan
             def update_prog(p):
@@ -550,7 +629,9 @@ class FaceCutApp(ctk.CTk):
                 preview_callback=update_preview,
                 stop_event=self.stop_event,
                 start_time=start_time,
-                end_time=end_time
+                end_time=end_time,
+                keep_no_face=keep_noface,
+                min_no_face_duration=min_noface_dur
             )
 
             if segments is None: # Stopped

@@ -63,7 +63,7 @@ class VideoProcessor:
 
     def ensure_fan(self):
         if self.fan is None:
-            print("Loading FAN (Face Alignment Network) for strict validation...")
+            print(f"Loading FAN (Face Alignment Network) for strict validation on {self.device}...")
             try:
                 # Use CPU/Cuda based on avail. '2D' landmarks.
                 self.fan = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, 
@@ -71,9 +71,9 @@ class VideoProcessor:
                                                       face_detector='blazeface',
                                                       compile=False) # Use lightweight internal detector?
                                                       # Actually we pass the rect, so detector matters less, but blazeface is standard.
-                print("FAN loaded.")
+                print(f"FAN loaded on {self.device}.")
             except Exception as e:
-                print(f"Failed to load FAN: {e}")
+                print(f"Failed to load FAN on {self.device}: {e}")
                 
     def ensure_models(self):
         # Gender (FairFace - racially balanced)
@@ -118,22 +118,34 @@ class VideoProcessor:
     def load_models(self):
         # Gender (FairFace via onnxruntime - multi-head output)
         try:
+            providers = ['CPUExecutionProvider']
+            if self.device == 'cuda' and 'CUDAExecutionProvider' in ort.get_available_providers():
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                
             self.gender_net = ort.InferenceSession(
-                self.gender_model, providers=['CPUExecutionProvider'])
+                self.gender_model, providers=providers)
             input_meta = self.gender_net.get_inputs()[0]
             self.gender_input_name = input_meta.name
             self.gender_output_names = [o.name for o in self.gender_net.get_outputs()]
-            print(f"Loaded FairFace gender model ({len(self.gender_output_names)} heads)")
+            
+            active_provider = self.gender_net.get_providers()[0]
+            print(f"Loaded FairFace gender model ({len(self.gender_output_names)} heads) using {active_provider}")
         except Exception as e:
             print(f"Failed to load gender model: {e}")
             self.gender_net = None
 
         # Rec
         try:
-            self.rec_net = cv2.dnn.readNetFromONNX(self.rec_model)
-            # Use default backend (auto-detect) for better stability
-            self.rec_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
-            self.rec_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            providers = ['CPUExecutionProvider']
+            if self.device == 'cuda' and 'CUDAExecutionProvider' in ort.get_available_providers():
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                
+            self.rec_net = ort.InferenceSession(self.rec_model, providers=providers)
+            self.rec_input_name = self.rec_net.get_inputs()[0].name
+            self.rec_output_names = [o.name for o in self.rec_net.get_outputs()]
+            
+            active_provider = self.rec_net.get_providers()[0]
+            print(f"Loaded Face Recognition model using {active_provider}")
         except Exception as e:
             print(f"Failed to load rec model: {e}")
             self.rec_net = None
@@ -160,13 +172,17 @@ class VideoProcessor:
             # Standard Resize if not already aligned
             blob_input = cv2.resize(face_img, (112, 112))
         else:
-            blob_input = face_img
+            blob_input = face_img.copy()
              
-        blob = cv2.dnn.blobFromImage(blob_input, 1.0/127.5, (112, 112), 
-                                   (127.5, 127.5, 127.5), 
-                                   swapRB=True, crop=False)
-        self.rec_net.setInput(blob)
-        embedding = self.rec_net.forward()
+        # Preprocessing for ONNX Runtime
+        blob_input = cv2.cvtColor(blob_input, cv2.COLOR_BGR2RGB)
+        blob_input = blob_input.astype(np.float32)
+        blob_input = (blob_input - 127.5) / 127.5
+        blob_input = np.transpose(blob_input, (2, 0, 1))
+        blob_input = np.expand_dims(blob_input, axis=0)
+        
+        outputs = self.rec_net.run(self.rec_output_names, {self.rec_input_name: blob_input})
+        embedding = outputs[0]
         # Quality Score (Feature Norm)
         feature_norm = np.linalg.norm(embedding)
         
@@ -807,6 +823,7 @@ class VideoProcessor:
         Evaluate a single face against criteria.
         Returns: (passed_filters, low_quality_fail_only, details_dict)
         low_quality_fail_only: True if face failed ONLY due to quality score.
+        details_dict includes 'gender' key with the raw predicted gender string.
         """
         x1, y1, x2, y2, conf, landmarks = detection
         img_h, img_w = frame.shape[:2]
@@ -828,7 +845,7 @@ class VideoProcessor:
                   
                   if preds is None or len(preds) == 0:
                        # FAN Failed -> Bad Face Structure
-                       return False, False, {"label": " NoStruct", "quality": 0.0}
+                       return False, False, {"label": " NoStruct", "quality": 0.0, "gender": "Unknown"}
                   
                   # FAN Succeeded -> Use refined landmarks
                   landmarks = preds[0] # 68 points
@@ -836,13 +853,14 @@ class VideoProcessor:
              except Exception as e:
                   print(f"FAN Error: {e}")
                   # Fallback or strict fail? Let's strict fail to be safe.
-                  return False, False, {"label": " FanErr", "quality": 0.0}
+                  return False, False, {"label": " FanErr", "quality": 0.0, "gender": "Unknown"}
         
         passed = True
         low_quality_fail = False
         gender_label = ""
         quality_score = 0.0
         rec_score = 0.0
+        detected_gender = "Unknown"
         
         # Pre-compute face crop and aligned face for both gender and quality checks
         face_crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
@@ -850,21 +868,24 @@ class VideoProcessor:
         if landmarks is not None:
              align_img = self.align_face(frame, landmarks)
         
-        # Gender check - use padded bbox crop matching InsightFace preprocessing
+        # Always predict gender for tagging (even when target_gender == "All")
+        if face_crop.size > 0:
+             detected_gender = self.predict_gender(frame, (x1, y1, x2, y2))
+             gender_label += f" {detected_gender}"
+        
+        # Gender filter check
         if target_gender != "All":
              if face_crop.size > 0:
-                  gender = self.predict_gender(frame, (x1, y1, x2, y2))
-                  gender_label += f" {gender}"
-                  if gender == "Unknown":
+                  if detected_gender == "Unknown":
                        # Uncertain detection - skip this face when filtering by gender
                        passed = False
-                  elif gender != target_gender:
+                  elif detected_gender != target_gender:
                        passed = False
              else:
                   passed = False
                    
         if not passed:
-             return False, False, {"label": gender_label, "quality": 0.0}
+             return False, False, {"label": gender_label, "quality": 0.0, "gender": detected_gender}
 
         # Rec / Quality
         if min_face_quality > 0 or self.reference_embedding is not None:
@@ -910,9 +931,9 @@ class VideoProcessor:
              else:
                  passed = False
         
-        return passed, low_quality_fail, {"label": gender_label, "quality": quality_score}
+        return passed, low_quality_fail, {"label": gender_label, "quality": quality_score, "gender": detected_gender}
 
-    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None, start_time=0.0, end_time=0.0):
+    def scan_video(self, video_path, min_conf, min_duration=0.0, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0, progress_callback=None, preview_callback=None, stop_event=None, start_time=0.0, end_time=0.0, keep_no_face=True, min_no_face_duration=0.0):
         # Reset quality EMA at the start of each video scan for fresh smoothing
         self.quality_ema = None
         
@@ -940,6 +961,10 @@ class VideoProcessor:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         
         valid_frames = []
+        # Track per-frame gender detections: frame_idx -> set of genders
+        frame_genders = {}
+        # Track which frames are no-face (for min_no_face_duration filtering)
+        no_face_frames = set()
         frame_idx = start_frame
         
         while cap.isOpened():
@@ -967,57 +992,89 @@ class VideoProcessor:
             detections = self.detect_faces(frame, min_conf, max_angle)
             
             is_valid = False
+            has_face_with_low_quality = False
             img_h, img_w, _ = frame.shape
             
             low_qual_candidates = 0
+            frame_gender_set = set()
             
             # Phase 1: Standard Evaluation
-            # We need to reconstruct the logic using evaluate_face
-            # But wait, evaluate_face recalculates everything. 
-            # We can just iterate detections.
-            
             evaluated_detections = [] # Store (det, details, passed) for preview
             
-            for det in detections:
-                 passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality, rgb_frame=rgb_frame)
-                 if passed:
-                      is_valid = True
-                 if low_qual_fail:
-                      low_qual_candidates += 1
-                 
-                 evaluated_detections.append((det, passed, details))
+            if len(detections) == 0:
+                # No face detected in this frame
+                if keep_no_face:
+                    is_valid = True
+                else:
+                    is_valid = False
+            else:
+                for det in detections:
+                     passed, low_qual_fail, details = self.evaluate_face(frame, det, target_gender, rec_threshold, min_face_quality, rgb_frame=rgb_frame)
+                     if passed:
+                          is_valid = True
+                     if low_qual_fail:
+                          low_qual_candidates += 1
+                          has_face_with_low_quality = True
+                     
+                     # Track gender from this detection
+                     det_gender = details.get("gender", "Unknown")
+                     if det_gender and det_gender != "Unknown":
+                          frame_gender_set.add(det_gender)
+                     
+                     evaluated_detections.append((det, passed, details))
 
-            # Phase 2: Smart Rotation Retry
-            if not is_valid and low_qual_candidates > 0 and max_angle > 60 and min_face_quality > 0:
-                 # Retry with rotations
-                 h, w = frame.shape[:2]
-                 rotations = [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
-                 
-                 for rot in rotations:
-                      frame_rot = cv2.rotate(frame, rot)
-                      rgb_rot = cv2.rotate(rgb_frame, rot)
-                      dets_rot = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
-                      
-                      for d_rot in dets_rot:
-                           # Map back
-                           x1, y1, x2, y2, conf, lms = d_rot
-                           (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, rot, w, h)
-                           det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
-                           
-                           # Evaluate on the ROTATED frame (where face is upright)
-                           passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True, rgb_frame=rgb_rot)
-                           
-                           if passed:
-                                is_valid = True
-                                evaluated_detections.append((det_orig, passed, details))
-                                detections.append(det_orig)
-                                break
-                      
-                      if is_valid:
-                           break
+                # If no face passed filters AND at least one failed due to low quality,
+                # then this frame should be discarded (face present but bad quality).
+                # If faces failed for OTHER reasons (wrong gender, wrong identity),
+                # still treat as no-valid-face frame -> keep it.
+                if not is_valid:
+                    if has_face_with_low_quality:
+                        # Face detected but quality too low -> discard frame
+                        is_valid = False
+                    else:
+                        # Face detected but failed other filters (gender/rec) ->
+                        # keep the frame (treat like no relevant face)
+                        is_valid = True
+
+                # Phase 2: Smart Rotation Retry (only if face with low quality was found)
+                if not is_valid and low_qual_candidates > 0 and max_angle > 60 and min_face_quality > 0:
+                     # Retry with rotations
+                     h, w = frame.shape[:2]
+                     rotations = [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
+                     
+                     for rot in rotations:
+                          frame_rot = cv2.rotate(frame, rot)
+                          rgb_rot = cv2.rotate(rgb_frame, rot)
+                          dets_rot = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
+                          
+                          for d_rot in dets_rot:
+                               # Map back
+                               x1, y1, x2, y2, conf, lms = d_rot
+                               (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, rot, w, h)
+                               det_orig = (rx1, ry1, rx2, ry2, conf, rlms)
+                               
+                               # Evaluate on the ROTATED frame (where face is upright)
+                               passed, low_qual_fail, details = self.evaluate_face(frame_rot, d_rot, target_gender, rec_threshold, min_face_quality, force_tilt_boost=True, rgb_frame=rgb_rot)
+                               
+                               if passed:
+                                    is_valid = True
+                                    evaluated_detections.append((det_orig, passed, details))
+                                    detections.append(det_orig)
+                                    # Track gender from rotation retry
+                                    det_gender = details.get("gender", "Unknown")
+                                    if det_gender and det_gender != "Unknown":
+                                         frame_gender_set.add(det_gender)
+                                    break
+                          
+                          if is_valid:
+                               break
             
             if is_valid:
                 valid_frames.append(frame_idx)
+                if frame_gender_set:
+                    frame_genders[frame_idx] = frame_gender_set
+                if len(detections) == 0:
+                    no_face_frames.add(frame_idx)
 
             # Preview Callback
             if preview_callback and frame_idx % 2 == 0:
@@ -1052,6 +1109,36 @@ class VideoProcessor:
 
         cap.release()
         
+        # Post-process: filter out short no-face runs
+        if keep_no_face and min_no_face_duration > 0 and valid_frames and no_face_frames:
+            min_no_face_frames_count = int(min_no_face_duration * fps)
+            # Find consecutive runs of no-face frames within valid_frames
+            frames_to_remove = set()
+            run_start = None
+            run_frames = []
+            
+            for f in valid_frames:
+                if f in no_face_frames:
+                    if run_start is None:
+                        run_start = f
+                        run_frames = [f]
+                    else:
+                        run_frames.append(f)
+                else:
+                    # End of a no-face run
+                    if run_start is not None:
+                        if len(run_frames) < min_no_face_frames_count:
+                            frames_to_remove.update(run_frames)
+                        run_start = None
+                        run_frames = []
+            
+            # Handle trailing run
+            if run_start is not None and len(run_frames) < min_no_face_frames_count:
+                frames_to_remove.update(run_frames)
+            
+            if frames_to_remove:
+                valid_frames = [f for f in valid_frames if f not in frames_to_remove]
+        
         if not valid_frames:
             return [], "No valid frames found matching criteria."
 
@@ -1067,63 +1154,230 @@ class VideoProcessor:
         if valid_frames:
             start = valid_frames[0]
             prev = valid_frames[0]
+            prev_is_noface = (valid_frames[0] in no_face_frames)
             
             for f in valid_frames[1:]:
-                if f - prev > gap_tolerance:
+                cur_is_noface = (f in no_face_frames)
+                # Force a segment break when transitioning between face and no-face regions
+                face_type_changed = (cur_is_noface != prev_is_noface)
+                
+                if f - prev > gap_tolerance or face_type_changed:
                     # Check duration
                     duration = (prev - start + 1) / fps
                     if duration >= min_duration:
-                        segments.append({'start_frame': start, 'end_frame': prev})
+                        seg = self._build_segment(start, prev, frame_genders, no_face_frames)
+                        segments.append(seg)
                     start = f
+                    prev_is_noface = cur_is_noface
                 prev = f
             
             # Check last segment
             duration = (prev - start + 1) / fps
             if duration >= min_duration:
-                segments.append({'start_frame': start, 'end_frame': prev})
+                seg = self._build_segment(start, prev, frame_genders, no_face_frames)
+                segments.append(seg)
 
         return segments, "Scanning complete."
 
+    def _build_segment(self, start_frame, end_frame, frame_genders, no_face_frames=None):
+        """
+        Build a segment dict with metadata including gender tags.
+        frame_genders: dict mapping frame_idx -> set of detected genders.
+        no_face_frames: set of frame indices where no face was detected.
+        """
+        # Collect all genders detected across frames in this segment
+        segment_genders = set()
+        for f in range(start_frame, end_frame + 1):
+            if f in frame_genders:
+                segment_genders.update(frame_genders[f])
+        
+        has_male = "Male" in segment_genders
+        
+        # Determine if this segment contains any face-detected frames
+        has_face = True
+        if no_face_frames is not None:
+            # Check if ALL frames in this segment are no-face frames
+            all_noface = all(f in no_face_frames for f in range(start_frame, end_frame + 1))
+            has_face = not all_noface
+        
+        seg = {
+            'start_frame': start_frame,
+            'end_frame': end_frame,
+            'has_male': has_male,
+            'has_face': has_face,
+            'genders': sorted(list(segment_genders))
+        }
+        return seg
+
     def render_video(self, video_path, output_path, segments, progress_callback=None, stop_event=None):
         try:
+            import subprocess
+            import tempfile
+            
             cap = cv2.VideoCapture(video_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            original_clip = VideoFileClip(video_path)
-            subclips = []
+            # Calculate total frames to write for progress tracking
+            total_frames_to_write = sum(
+                seg['end_frame'] - seg['start_frame'] + 1 for seg in segments
+            )
             
-            total_segments = len(segments)
-            for i, seg in enumerate(segments):
+            # Write video frames with OpenCV for frame-precise cuts
+            # Use a temp file for video-only, then mux audio
+            temp_dir = os.path.dirname(output_path) or '.'
+            temp_video = os.path.join(temp_dir, '_facecut_temp_video.mp4')
+            
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(temp_video, fourcc, fps, (frame_w, frame_h))
+            
+            if not writer.isOpened():
+                cap.release()
+                return False, "Failed to create video writer."
+            
+            frames_written = 0
+            
+            for seg_idx, seg in enumerate(segments):
                 if stop_event and stop_event.is_set():
-                     original_clip.close()
-                     return False, "Rendering stopped by user."
+                    writer.release()
+                    cap.release()
+                    if os.path.exists(temp_video):
+                        os.remove(temp_video)
+                    return False, "Rendering stopped by user."
                 
                 start_frame = seg['start_frame']
                 end_frame = seg['end_frame']
                 
-                start_time = start_frame / fps
-                end_time = min((end_frame + 1) / fps, original_clip.duration)
-                subclips.append(original_clip.subclip(start_time, end_time))
+                # Seek to exact start frame
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
                 
-                if progress_callback:
-                    progress_callback((i + 1) / total_segments)
-
-            if not subclips:
-                 original_clip.close()
-                 return False, "No valid clips generated."
-
-            final_clip = concatenate_videoclips(subclips)
+                for f_idx in range(start_frame, end_frame + 1):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    writer.write(frame)
+                    frames_written += 1
+                    
+                    if progress_callback and frames_written % 30 == 0:
+                        progress_callback(frames_written / total_frames_to_write * 0.7)  # 70% for video
             
-            # Note: writing videofile is blocking and hard to report granular progress on without a custom logger
-            # We can just let it run.
-            final_clip.write_videofile(output_path, codec='libx264', audio_codec='aac', verbose=False, logger=None)
+            writer.release()
+            cap.release()
             
-            original_clip.close()
-            final_clip.close()
+            if frames_written == 0:
+                if os.path.exists(temp_video):
+                    os.remove(temp_video)
+                return False, "No frames written."
+            
+            # Now mux audio from original video
+            # Extract and concatenate audio segments using MoviePy, then mux with ffmpeg
+            has_audio = False
+            temp_audio = os.path.join(temp_dir, '_facecut_temp_audio.m4a')
+            
+            try:
+                original_clip = VideoFileClip(video_path)
+                if original_clip.audio is not None:
+                    audio_subclips = []
+                    for seg in segments:
+                        start_time = seg['start_frame'] / fps
+                        end_time = min((seg['end_frame'] + 1) / fps, original_clip.duration)
+                        if end_time > start_time:
+                            audio_subclips.append(original_clip.audio.subclip(start_time, end_time))
+                    
+                    if audio_subclips:
+                        from moviepy.editor import concatenate_audioclips
+                        final_audio = concatenate_audioclips(audio_subclips)
+                        final_audio.write_audiofile(temp_audio, codec='aac', verbose=False, logger=None)
+                        final_audio.close()
+                        has_audio = True
+                
+                original_clip.close()
+            except Exception as e:
+                print(f"Audio extraction warning: {e}")
+                has_audio = False
+            
+            if progress_callback:
+                progress_callback(0.85)
+            
+            # Mux video + audio with ffmpeg for best quality
+            if has_audio and os.path.exists(temp_audio):
+                try:
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video,
+                        '-i', temp_audio,
+                        '-c:v', 'libx264',
+                        '-preset', 'medium',
+                        '-crf', '18',
+                        '-c:a', 'aac',
+                        '-b:a', '192k',
+                        '-shortest',
+                        '-movflags', '+faststart',
+                        output_path
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    
+                    if result.returncode != 0:
+                        # Fallback: try without audio
+                        print(f"ffmpeg mux failed: {result.stderr[:500]}")
+                        cmd_noaudio = [
+                            'ffmpeg', '-y',
+                            '-i', temp_video,
+                            '-c:v', 'libx264',
+                            '-preset', 'medium',
+                            '-crf', '18',
+                            '-movflags', '+faststart',
+                            output_path
+                        ]
+                        subprocess.run(cmd_noaudio, capture_output=True, text=True, timeout=600)
+                        
+                except FileNotFoundError:
+                    # ffmpeg not available, use MoviePy to re-encode
+                    print("ffmpeg not found, falling back to MoviePy mux...")
+                    from moviepy.editor import AudioFileClip
+                    video_clip = VideoFileClip(temp_video)
+                    audio_clip = AudioFileClip(temp_audio)
+                    video_clip = video_clip.set_audio(audio_clip)
+                    video_clip.write_videofile(output_path, codec='libx264', audio_codec='aac', verbose=False, logger=None)
+                    video_clip.close()
+                    audio_clip.close()
+            else:
+                # No audio — just re-encode with ffmpeg or copy
+                try:
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video,
+                        '-c:v', 'libx264',
+                        '-preset', 'medium',
+                        '-crf', '18',
+                        '-movflags', '+faststart',
+                        output_path
+                    ]
+                    subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                except FileNotFoundError:
+                    # No ffmpeg — just rename temp as output
+                    shutil.move(temp_video, output_path)
+                    temp_video = None  # Already moved
+            
+            # Cleanup temp files
+            if temp_video and os.path.exists(temp_video):
+                os.remove(temp_video)
+            if os.path.exists(temp_audio):
+                os.remove(temp_audio)
+            
+            if progress_callback:
+                progress_callback(1.0)
             
             return True, "Processing complete."
         except Exception as e:
+            # Cleanup on error
+            temp_video_path = os.path.join(os.path.dirname(output_path) or '.', '_facecut_temp_video.mp4')
+            temp_audio_path = os.path.join(os.path.dirname(output_path) or '.', '_facecut_temp_audio.m4a')
+            for tmp in [temp_video_path, temp_audio_path]:
+                if os.path.exists(tmp):
+                    try: os.remove(tmp)
+                    except: pass
             return False, f"Video editing error: {str(e)}"
 
     def process_frame(self, frame, min_conf, max_angle=90, target_gender="All", rec_threshold=0.5, min_face_quality=0.0):
