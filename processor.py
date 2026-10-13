@@ -620,10 +620,9 @@ class VideoProcessor:
         pitch = (pitch_ratio - center_ratio) * 180 
         
         return yaw, pitch
-
     def rotate_coords(self, coords, landmarks, rotation, w, h):
         """
-        Map coordinates from a rotated frame back to original.
+        Map coordinates from a 90° rotated frame back to original.
         rotation: cv2.ROTATE_90_CLOCKWISE or cv2.ROTATE_90_COUNTERCLOCKWISE
         w, h: Dimensions of the ORIGINAL frame (before rotation).
         coords: (x1, y1, x2, y2)
@@ -634,19 +633,8 @@ class VideoProcessor:
         def transform_point(pt):
             x, y = pt
             if rotation == cv2.ROTATE_90_CLOCKWISE:
-                # 90 CW: x' = h - 1 - y, y' = x
-                # Inverse: x = y', y = h - 1 - x'
-                # Here pt is (x', y') in rotated frame
-                # The rotated frame has width=h, height=w.
-                # FORMULA MAPS BACK TO ORIGINAL (w, h)
-                # x_orig = y_rot
-                # y_orig = h - 1 - x_rot
                 return [y, h - 1 - x]
             elif rotation == cv2.ROTATE_90_COUNTERCLOCKWISE:
-                # 90 CCW: x' = y, y' = w - 1 - x
-                # Inverse: x = w - 1 - y', y = x'
-                # x_orig = w - 1 - y_rot
-                # y_orig = x_rot
                 return [w - 1 - y, x]
             return [x, y]
 
@@ -670,54 +658,159 @@ class VideoProcessor:
              
         return (int(lx1), int(ly1), int(lx2), int(ly2)), new_lms
 
-    def detect_faces(self, frame, min_conf, max_angle=90):
+    def _rotate_frame_arbitrary(self, frame, angle_degrees):
+        """
+        Rotate frame by an arbitrary angle (degrees, counter-clockwise positive).
+        Returns: (rotated_frame, rotation_matrix_M)
+        The rotation matrix M can be inverted to map coordinates back.
+        """
+        h, w = frame.shape[:2]
+        center = (w / 2.0, h / 2.0)
+        M = cv2.getRotationMatrix2D(center, angle_degrees, 1.0)
+        
+        # Compute new bounding box dimensions so nothing is cropped
+        cos_a = abs(M[0, 0])
+        sin_a = abs(M[0, 1])
+        new_w = int(h * sin_a + w * cos_a)
+        new_h = int(h * cos_a + w * sin_a)
+        
+        # Adjust translation to keep the image centered
+        M[0, 2] += (new_w - w) / 2.0
+        M[1, 2] += (new_h - h) / 2.0
+        
+        rotated = cv2.warpAffine(frame, M, (new_w, new_h))
+        return rotated, M
+
+    def _unrotate_coords(self, coords, landmarks, M, orig_w, orig_h):
+        """
+        Map bounding box and landmarks from a rotated frame back to the original
+        using the inverse of rotation matrix M.
+        """
+        x1, y1, x2, y2 = coords
+        M_inv = cv2.invertAffineTransform(M)
+        
+        # Transform all 4 corners of the bbox
+        corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64)
+        ones = np.ones((4, 1), dtype=np.float64)
+        corners_h = np.hstack([corners, ones])
+        transformed = (M_inv @ corners_h.T).T
+        
+        xs = transformed[:, 0]
+        ys = transformed[:, 1]
+        
+        rx1 = max(0, int(np.min(xs)))
+        ry1 = max(0, int(np.min(ys)))
+        rx2 = min(orig_w, int(np.max(xs)))
+        ry2 = min(orig_h, int(np.max(ys)))
+        
+        # Transform landmarks
+        new_lms = None
+        if landmarks is not None:
+            lms = np.array(landmarks, dtype=np.float64)
+            ones_l = np.ones((len(lms), 1), dtype=np.float64)
+            lms_h = np.hstack([lms, ones_l])
+            new_lms = (M_inv @ lms_h.T).T.astype(np.float32)
+        
+        return (rx1, ry1, rx2, ry2), new_lms
+
+    def detect_faces(self, frame, min_conf, max_angle=90, try_rotations=True):
         """
         Multi-rotation wrapper for detection.
-        Optimized to minimize color space conversions.
+        Progressively tries more rotation angles to catch tilted faces.
+        Angles tried (in order): 0°, then 90°/270°, then 45°/315°, then 180°, then 135°/225°.
+        Stops as soon as faces are found for performance.
+        
+        try_rotations: If False, skip all rotation passes (used when previous
+                       frame had no face, so rotation retry is unlikely to help).
         """
         # Convert to RGB once for all detection passes
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Pass 1: Original
+        # Pass 1: Original (0°)
         detections = self._detect_single_pass(frame, rgb_frame, min_conf, max_angle)
         
-        if max_angle > 60 and len(detections) == 0:
-             h, w = frame.shape[:2]
-             
-             # Pass 2: 90 CW
-             frame_90 = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-             rgb_90 = cv2.rotate(rgb_frame, cv2.ROTATE_90_CLOCKWISE)
-             dets_90 = self._detect_single_pass(frame_90, rgb_90, min_conf, max_angle)
-             
-             for det in dets_90:
-                  x1, y1, x2, y2, conf, lms = det
-                  (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, cv2.ROTATE_90_CLOCKWISE, w, h)
-                  detections.append((rx1, ry1, rx2, ry2, conf, rlms))
-                  
-             # Pass 3: 90 CCW
-             frame_n90 = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-             rgb_n90 = cv2.rotate(rgb_frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-             dets_n90 = self._detect_single_pass(frame_n90, rgb_n90, min_conf, max_angle)
-             
-             for det in dets_n90:
-                  x1, y1, x2, y2, conf, lms = det
-                  (rx1, ry1, rx2, ry2), rlms = self.rotate_coords((x1, y1, x2, y2), lms, cv2.ROTATE_90_COUNTERCLOCKWISE, w, h)
-                  detections.append((rx1, ry1, rx2, ry2, conf, rlms))
-             
-             # NMS to merge duplicates
-             if len(detections) > 1:
-                  boxes = []
-                  scores = []
-                  for d in detections:
-                       boxes.append([d[0], d[1], d[2]-d[0], d[3]-d[1]]) # x, y, w, h
-                       scores.append(float(d[4]))
-                  
-                  indices = cv2.dnn.NMSBoxes(boxes, scores, min_conf, 0.4)
-                  if len(indices) > 0:
-                       new_dets = []
-                       for i in indices.flatten():
-                            new_dets.append(detections[i])
-                       detections = new_dets
+        if try_rotations and max_angle > 60 and len(detections) == 0:
+            h, w = frame.shape[:2]
+            
+            # Define rotation passes in priority order
+            # Group 1: 90°/270° (most common tilt, fast via cv2.rotate)
+            # Group 2: 45°/315° (moderate tilt dead zone)
+            # Group 3: 180° (upside down)
+            # Group 4: 135°/225° (extreme tilt dead zone)
+            rotation_groups = [
+                [90, -90],       # 90° CW and CCW
+                [45, -45],       # 45° tilts
+                [180],           # Upside down
+                [135, -135],     # 135° tilts
+            ]
+            
+            for group in rotation_groups:
+                if len(detections) > 0:
+                    break
+                    
+                for angle in group:
+                    # Use cv2.rotate for exact 90° multiples (faster, no interpolation)
+                    if angle == 90:
+                        frame_rot = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                        rgb_rot = cv2.rotate(rgb_frame, cv2.ROTATE_90_CLOCKWISE)
+                        dets = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
+                        for det in dets:
+                            bx1, by1, bx2, by2, conf, lms = det
+                            (rx1, ry1, rx2, ry2), rlms = self.rotate_coords(
+                                (bx1, by1, bx2, by2), lms, cv2.ROTATE_90_CLOCKWISE, w, h)
+                            detections.append((rx1, ry1, rx2, ry2, conf, rlms))
+                    elif angle == -90:
+                        frame_rot = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        rgb_rot = cv2.rotate(rgb_frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        dets = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
+                        for det in dets:
+                            bx1, by1, bx2, by2, conf, lms = det
+                            (rx1, ry1, rx2, ry2), rlms = self.rotate_coords(
+                                (bx1, by1, bx2, by2), lms, cv2.ROTATE_90_COUNTERCLOCKWISE, w, h)
+                            detections.append((rx1, ry1, rx2, ry2, conf, rlms))
+                    elif angle == 180:
+                        frame_rot = cv2.rotate(frame, cv2.ROTATE_180)
+                        rgb_rot = cv2.rotate(rgb_frame, cv2.ROTATE_180)
+                        dets = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
+                        for det in dets:
+                            bx1, by1, bx2, by2, conf, lms = det
+                            # 180° inverse: x_orig = w-1-x_rot, y_orig = h-1-y_rot
+                            rx1 = w - 1 - bx2
+                            ry1 = h - 1 - by2
+                            rx2 = w - 1 - bx1
+                            ry2 = h - 1 - by1
+                            rlms = None
+                            if lms is not None:
+                                rlms = np.array([[w - 1 - lm[0], h - 1 - lm[1]] for lm in lms], dtype=np.float32)
+                            detections.append((rx1, ry1, rx2, ry2, conf, rlms))
+                    else:
+                        # Arbitrary angle rotation (45°, -45°, 135°, -135°)
+                        frame_rot, M = self._rotate_frame_arbitrary(frame, angle)
+                        rgb_rot, _ = self._rotate_frame_arbitrary(rgb_frame, angle)
+                        dets = self._detect_single_pass(frame_rot, rgb_rot, min_conf, max_angle)
+                        for det in dets:
+                            bx1, by1, bx2, by2, conf, lms = det
+                            (rx1, ry1, rx2, ry2), rlms = self._unrotate_coords(
+                                (bx1, by1, bx2, by2), lms, M, w, h)
+                            detections.append((rx1, ry1, rx2, ry2, conf, rlms))
+                    
+                    if len(detections) > 0:
+                        break
+            
+            # NMS to merge duplicates from multiple rotation passes
+            if len(detections) > 1:
+                boxes = []
+                scores = []
+                for d in detections:
+                    boxes.append([d[0], d[1], d[2]-d[0], d[3]-d[1]])  # x, y, w, h
+                    scores.append(float(d[4]))
+                
+                indices = cv2.dnn.NMSBoxes(boxes, scores, min_conf, 0.4)
+                if len(indices) > 0:
+                    new_dets = []
+                    for i in indices.flatten():
+                        new_dets.append(detections[i])
+                    detections = new_dets
         
         return detections
 
@@ -965,6 +1058,7 @@ class VideoProcessor:
         frame_genders = {}
         # Track which frames are no-face (for min_no_face_duration filtering)
         no_face_frames = set()
+        prev_best_conf = 0.0  # Track best detection confidence from previous frame for rotation optimization
         frame_idx = start_frame
         
         while cap.isOpened():
@@ -989,7 +1083,11 @@ class VideoProcessor:
 
             # Run inference - convert to RGB once and reuse for detection and evaluation
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            detections = self.detect_faces(frame, min_conf, max_angle)
+            # Only try expensive rotation passes if previous frame had a confident face
+            # detection (conf >= 0.5), meaning a real face was present and may have tilted.
+            # Skip rotations in long no-face stretches or noisy low-confidence detections.
+            prev_was_confident = prev_best_conf >= 0.5
+            detections = self.detect_faces(frame, min_conf, max_angle, try_rotations=prev_was_confident)
             
             is_valid = False
             has_face_with_low_quality = False
@@ -1104,6 +1202,13 @@ class VideoProcessor:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
                 preview_callback(annotated_frame)
+            
+            # Update face tracking state for rotation optimization
+            # Track the best detection confidence from this frame
+            if len(detections) > 0:
+                prev_best_conf = max(det[4] for det in detections)
+            else:
+                prev_best_conf = 0.0
                          
             frame_idx += 1
 
@@ -1300,37 +1405,69 @@ class VideoProcessor:
             if progress_callback:
                 progress_callback(0.85)
             
+            # Detect best available H.264 encoder (GPU > CPU)
+            def _get_ffmpeg_encoder():
+                """Auto-detect NVENC GPU encoder, fall back to libx264 CPU."""
+                try:
+                    probe = subprocess.run(
+                        ['ffmpeg', '-hide_banner', '-encoders'],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if 'h264_nvenc' in probe.stdout:
+                        print("Using NVIDIA NVENC hardware encoder (h264_nvenc)")
+                        return 'h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '18']
+                except Exception:
+                    pass
+                print("Using CPU encoder (libx264)")
+                return 'libx264', ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18']
+
+            ffmpeg_timeout = 7200  # 2 hours — safe for long/high-res videos
+
             # Mux video + audio with ffmpeg for best quality
             if has_audio and os.path.exists(temp_audio):
                 try:
-                    cmd = [
+                    # Strategy 1: Stream-copy video (instant, no re-encode)
+                    cmd_copy = [
                         'ffmpeg', '-y',
                         '-i', temp_video,
                         '-i', temp_audio,
-                        '-c:v', 'libx264',
-                        '-preset', 'medium',
-                        '-crf', '18',
+                        '-c:v', 'copy',
                         '-c:a', 'aac',
                         '-b:a', '192k',
                         '-shortest',
                         '-movflags', '+faststart',
                         output_path
                     ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    result = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=ffmpeg_timeout)
                     
                     if result.returncode != 0:
-                        # Fallback: try without audio
-                        print(f"ffmpeg mux failed: {result.stderr[:500]}")
-                        cmd_noaudio = [
+                        # Strategy 2: Re-encode with best available encoder
+                        print(f"ffmpeg stream-copy mux failed, re-encoding: {result.stderr[:300]}")
+                        enc_name, enc_args = _get_ffmpeg_encoder()
+                        cmd_reencode = [
                             'ffmpeg', '-y',
                             '-i', temp_video,
-                            '-c:v', 'libx264',
-                            '-preset', 'medium',
-                            '-crf', '18',
+                            '-i', temp_audio,
+                            *enc_args,
+                            '-c:a', 'aac',
+                            '-b:a', '192k',
+                            '-shortest',
                             '-movflags', '+faststart',
                             output_path
                         ]
-                        subprocess.run(cmd_noaudio, capture_output=True, text=True, timeout=600)
+                        result2 = subprocess.run(cmd_reencode, capture_output=True, text=True, timeout=ffmpeg_timeout)
+                        
+                        if result2.returncode != 0:
+                            # Strategy 3: Re-encode without audio
+                            print(f"ffmpeg mux with audio failed: {result2.stderr[:300]}")
+                            cmd_noaudio = [
+                                'ffmpeg', '-y',
+                                '-i', temp_video,
+                                *enc_args,
+                                '-movflags', '+faststart',
+                                output_path
+                            ]
+                            subprocess.run(cmd_noaudio, capture_output=True, text=True, timeout=ffmpeg_timeout)
                         
                 except FileNotFoundError:
                     # ffmpeg not available, use MoviePy to re-encode
@@ -1343,18 +1480,28 @@ class VideoProcessor:
                     video_clip.close()
                     audio_clip.close()
             else:
-                # No audio — just re-encode with ffmpeg or copy
+                # No audio — try stream-copy first, then re-encode
                 try:
-                    cmd = [
+                    cmd_copy = [
                         'ffmpeg', '-y',
                         '-i', temp_video,
-                        '-c:v', 'libx264',
-                        '-preset', 'medium',
-                        '-crf', '18',
+                        '-c:v', 'copy',
                         '-movflags', '+faststart',
                         output_path
                     ]
-                    subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    result = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=ffmpeg_timeout)
+                    
+                    if result.returncode != 0:
+                        print(f"ffmpeg stream-copy failed, re-encoding: {result.stderr[:300]}")
+                        enc_name, enc_args = _get_ffmpeg_encoder()
+                        cmd_reencode = [
+                            'ffmpeg', '-y',
+                            '-i', temp_video,
+                            *enc_args,
+                            '-movflags', '+faststart',
+                            output_path
+                        ]
+                        subprocess.run(cmd_reencode, capture_output=True, text=True, timeout=ffmpeg_timeout)
                 except FileNotFoundError:
                     # No ffmpeg — just rename temp as output
                     shutil.move(temp_video, output_path)
